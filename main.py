@@ -201,7 +201,15 @@ def main():
             }
             
         print("\n ✅ Procesamiento finalizado. Construyendo HTML...")
-        generar_html_moderno(db_json)
+        
+        # --- BASE DE FRECUENCIAS MOCK (Reemplazar luego con datos reales si es necesario) ---
+        db_frecuencias = {
+            "L1-AMASADORA-01": {"frecuencia": 4, "ultima_semana": 3},
+            "L2-HORNO-02": {"frecuencia": 12, "ultima_semana": 5},
+            "L1-CINTA-05": {"frecuencia": 2, "ultima_semana": 20},
+        }
+
+        generar_html_moderno(db_json, db_frecuencias)
 
     except Exception as e: 
         print(f"\n❌ Error Fatal: {e}")
@@ -211,7 +219,7 @@ def main():
 # ==========================================
 # 4. GENERADOR HTML
 # ==========================================
-def generar_html_moderno(db_json):
+def generar_html_moderno(db_json, db_frecuencias):
     fecha_actual = datetime.now(ZoneInfo("America/Santiago")).strftime("%d/%m/%Y %H:%M")
     
     html_template = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Dashboard Mantenimiento</title>
@@ -347,6 +355,21 @@ def generar_html_moderno(db_json):
         .gantt-shift-header { display:flex; justify-content:space-between; font-weight:700; font-size:0.85rem; margin-bottom:10px; padding-bottom:6px; text-transform:uppercase; }
         .gantt-card { background:white; border-left:4px solid transparent; padding:10px; margin-bottom:8px; border-radius:6px; font-size:0.8rem; cursor:pointer; box-shadow:0 2px 4px rgba(0,0,0,0.06); transition:transform 0.15s; }
         .gantt-card:hover { transform: translateY(-2px); box-shadow:0 4px 6px rgba(0,0,0,0.1); }
+        
+        /* ESTILOS GANTT PLAN MATRIZ */
+        .pm-table { border-collapse: collapse; width: 100%; text-align: center; font-size: 0.75rem; }
+        .pm-table th { background: var(--secondary); color: white; padding: 8px 4px; position: sticky; top: 0; z-index: 10; font-weight: 600; min-width: 30px; border: 1px solid #475569; }
+        .pm-table th.pm-tag-col { position: sticky; left: 0; background: var(--primary); z-index: 20; min-width: 250px; text-align: left; padding-left: 15px; }
+        .pm-table td { border: 1px solid var(--border); padding: 0; height: 35px; position: relative; }
+        .pm-table td.pm-tag-col { position: sticky; left: 0; background: #f8fafc; font-weight: 700; text-align: left; padding-left: 15px; z-index: 5; border-right: 2px solid var(--border); color: var(--primary); }
+        .pm-table tr:hover td.pm-tag-col { background: #e2e8f0; }
+        .pm-table tr:hover { background: #f1f5f9; }
+        .pm-cell-inner { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; }
+        .pm-cell-inner:hover { opacity: 0.8; transform: scale(1.1); }
+        .pm-plan { background: #e2e8f0; border-radius: 4px; width: 80%; height: 80%; margin: auto; }
+        .pm-ok { background: #22c55e; border-radius: 4px; width: 80%; height: 80%; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; }
+        .pm-pend { background: #ef4444; border-radius: 4px; width: 80%; height: 80%; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; }
+        .pm-proc { background: #f59e0b; border-radius: 4px; width: 80%; height: 80%; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; }
     </style>
 </head>
 <body>
@@ -378,7 +401,9 @@ def generar_html_moderno(db_json):
             <button class="tab-btn active" onclick="setView('list', this)" id="btn_tab_list">📋 Visor de OTs</button>
             <button class="tab-btn" onclick="setView('charts', this)">📊 Análisis y Tendencias</button>
             <button class="tab-btn" onclick="setView('row', this)">📈 ROW</button>
-            <button class="tab-btn" onclick="setView('gantt', this)">📅 Gantt / Turnos</button> </div>
+            <button class="tab-btn" onclick="setView('gantt', this)">📅 Gantt / Turnos</button>
+            <button class="tab-btn" onclick="setView('gantt_pm', this)">⚙️ Plan Matriz (Frecuencias)</button>
+        </div>
         <div style="display:flex; gap:10px;">
             <button onclick="descargarExcel()" class="btn-clean" style="margin: 0; padding: 8px 15px; width: auto; border-color: #10b981; color: #10b981; display: flex; align-items: center; gap: 8px;" title="Descargar datos filtrados">
                 <span style="font-size:1.2rem;">📊</span> Exportar Excel
@@ -495,6 +520,21 @@ def generar_html_moderno(db_json):
                 </div>
         </div>
 
+        <div id="view_gantt_pm" style="display:none; flex:1; flex-direction:column; overflow:hidden; padding:20px; background:#f8fafc;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-shrink:0;">
+                <h2 style="color:var(--primary); margin:0; font-size:1.5rem;">Plan Matriz de Mantenimiento</h2>
+                <div style="font-size:0.85rem; color:var(--muted);">Filtra por "Línea / Área" en el panel lateral para organizar los equipos.</div>
+            </div>
+            <div style="display:flex; gap:10px; margin-bottom:15px; font-size:0.8rem; font-weight:700;">
+                <span style="background:#e2e8f0; padding:4px 8px; border-radius:4px;">⬛ Planificado (Frecuencia)</span>
+                <span style="background:#dcfce7; color:#166534; padding:4px 8px; border-radius:4px;">🟩 OT Realizada</span>
+                <span style="background:#fef3c7; color:#92400e; padding:4px 8px; border-radius:4px;">🟨 OT En Proceso</span>
+                <span style="background:#fee2e2; color:#991b1b; padding:4px 8px; border-radius:4px;">🟥 OT Pendiente</span>
+            </div>
+            <div id="gantt_pm_container" style="flex:1; overflow:auto; background:white; border:1px solid var(--border); border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.05);">
+                </div>
+        </div>
+
     </div>
 
     <script>
@@ -502,6 +542,7 @@ def generar_html_moderno(db_json):
     Chart.defaults.plugins.datalabels.display = false; 
 
     const db = __DB_JSON_DATA__;
+    const baseFrecuencias = __FRECUENCIAS_JSON__;
     const records = Object.values(db).sort((a,b) => b.id_real - a.id_real);
     const weeks = [...new Set(records.map(x=>x.semana).filter(x=>x!=="S/N"))].sort((a,b)=>{ let na=parseInt(a), nb=parseInt(b); return (isNaN(na)||isNaN(nb)) ? a.localeCompare(b) : na-nb; });
     
@@ -607,6 +648,7 @@ def generar_html_moderno(db_json):
         document.getElementById('view_charts').style.display = 'none';
         document.getElementById('view_row').style.display = 'none';
         document.getElementById('view_gantt').style.display = 'none';
+        document.getElementById('view_gantt_pm').style.display = 'none';
 
         if (view === 'list') {
             document.getElementById('view_list').style.display = 'flex';
@@ -619,6 +661,9 @@ def generar_html_moderno(db_json):
         } else if (view === 'gantt') {
             document.getElementById('view_gantt').style.display = 'flex';
             setTimeout(() => { drawGantt(currentChartData); }, 50);
+        } else if (view === 'gantt_pm') {
+            document.getElementById('view_gantt_pm').style.display = 'flex';
+            setTimeout(() => { drawGanttPM(currentChartData); }, 50);
         }
         applyFilters();
     }
@@ -686,6 +731,7 @@ def generar_html_moderno(db_json):
         else if (appState.view === 'charts') drawCharts(currentChartData);
         else if (appState.view === 'row') drawRowCharts(currentChartData);
         else if (appState.view === 'gantt') drawGantt(currentChartData);
+        else if (appState.view === 'gantt_pm') drawGanttPM(currentChartData);
     }
 
     function renderList(data) {
@@ -1709,6 +1755,75 @@ def generar_html_moderno(db_json):
         container.innerHTML = htmlFinal;
     }
 
+    function drawGanttPM(data) {
+        const container = document.getElementById('gantt_pm_container');
+        if (!data || data.length === 0) {
+            container.innerHTML = `<div class="empty-state"><h3>No hay datos</h3><p>Ajusta los filtros (Ej. Línea/Área).</p></div>`;
+            return;
+        }
+
+        // 1. Extraer los TAGs únicos de la data filtrada actual
+        let equiposUnicos = [...new Set(data.map(d => d.tag).filter(t => t && t.trim() !== ''))].sort();
+        
+        // Mostrar filtro actual en el encabezado
+        const uVal = document.getElementById('f_ubi') ? document.getElementById('f_ubi').value : 'ALL';
+
+        // 2. Mapear las OTs ejecutadas por Equipo y Semana
+        let actPorEquipo = {};
+        equiposUnicos.forEach(tag => actPorEquipo[tag] = {});
+        
+        data.forEach(d => {
+            if(d.tag && actPorEquipo[d.tag] && d.semana !== "S/N") {
+                let semNum = parseInt(d.semana);
+                if(!isNaN(semNum)) {
+                    // Guardamos el estado y el ID para poder hacer click
+                    actPorEquipo[d.tag][semNum] = { status: d.status, id: d.key_id };
+                }
+            }
+        });
+
+        // 3. Generar la tabla HTML (Semanas de la 1 a la 52)
+        let html = `<table class="pm-table"><thead><tr><th class="pm-tag-col">Equipo / TAG (${uVal})</th>`;
+        for(let i = 1; i <= 52; i++) { html += `<th>S${i}</th>`; }
+        html += `</tr></thead><tbody>`;
+
+        equiposUnicos.forEach(tag => {
+            let titleTag = tag.length > 35 ? tag.substring(0,32) + '...' : tag;
+            html += `<tr><td class="pm-tag-col" title="${tag}">${titleTag}</td>`;
+            
+            let frecData = baseFrecuencias[tag] || { frecuencia: 0, ultima_semana: 0 };
+            
+            for(let sem = 1; sem <= 52; sem++) {
+                let cellHtml = ``;
+                let isPlanned = false;
+                
+                // Lógica de proyección de frecuencia
+                if (frecData.frecuencia > 0) {
+                    if ((sem - frecData.ultima_semana) % frecData.frecuencia === 0 && sem >= frecData.ultima_semana) {
+                        isPlanned = true;
+                    }
+                }
+
+                // ¿Hay una OT real en esta semana para este TAG?
+                let otReal = actPorEquipo[tag][sem];
+                
+                if (otReal) {
+                    let cssClass = otReal.status === 'realizada' ? 'pm-ok' : (otReal.status === 'en proceso' ? 'pm-proc' : 'pm-pend');
+                    let icon = otReal.status === 'realizada' ? '✓' : '!';
+                    cellHtml = `<div class="pm-cell-inner"><div class="${cssClass}" onclick="document.getElementById('btn_tab_list').click(); setTimeout(() => renderDetail('${otReal.id}'), 100);" title="Ver OT Real">${icon}</div></div>`;
+                } else if (isPlanned) {
+                    cellHtml = `<div class="pm-cell-inner"><div class="pm-plan" title="Mantenimiento Planificado según Frecuencia Base"></div></div>`;
+                }
+
+                html += `<td>${cellHtml}</td>`;
+            }
+            html += `</tr>`;
+        });
+
+        html += `</tbody></table>`;
+        container.innerHTML = html;
+    }
+
     // --- EFECTO ANTIGRAVEDAD / PARTÍCULAS ---
     const initAntigravity = () => {
         const canvas = document.createElement('canvas');
@@ -1824,6 +1939,7 @@ def generar_html_moderno(db_json):
 
     full_html = html_template.replace("__FECHA_ACTUAL__", fecha_actual)
     full_html = full_html.replace("__DB_JSON_DATA__", json.dumps(db_json))
+    full_html = full_html.replace("__FRECUENCIAS_JSON__", json.dumps(db_frecuencias))
     full_html = full_html.replace('\xa0', ' ')
     
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f: 
