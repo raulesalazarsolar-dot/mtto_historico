@@ -654,16 +654,16 @@ def generar_html_moderno(db_json, db_frecuencias):
             document.getElementById('view_list').style.display = 'flex';
         } else if (view === 'charts') {
             document.getElementById('view_charts').style.display = 'grid';
-            setTimeout(() => { drawCharts(currentChartData); }, 50);
         } else if (view === 'row') {
             document.getElementById('view_row').style.display = 'flex';
-            setTimeout(() => { drawRowCharts(currentChartData); }, 50);
         } else if (view === 'gantt') {
             document.getElementById('view_gantt').style.display = 'flex';
-            setTimeout(() => { drawGantt(currentChartData); }, 50);
         } else if (view === 'gantt_pm') {
             document.getElementById('view_gantt_pm').style.display = 'flex';
-            setTimeout(() => { drawGanttPM(currentChartData); }, 50);
+            let filtroSemana = document.getElementById('f_semana');
+            if (filtroSemana && filtroSemana.value !== 'ALL') {
+                filtroSemana.value = 'ALL';
+            }
         }
         applyFilters();
     }
@@ -1762,51 +1762,54 @@ def generar_html_moderno(db_json, db_frecuencias):
             return;
         }
 
-        // 1. Extraer los TAGs únicos de la data filtrada actual
-        let equiposUnicos = [...new Set(data.map(d => d.tag).filter(t => t && t.trim() !== ''))].sort();
-        
-        // Mostrar filtro actual en el encabezado
+        let tagDic = {};
+        data.forEach(d => {
+            if(d.tag && d.tag.trim() !== '') {
+                if(!tagDic[d.tag]) {
+                    tagDic[d.tag] = d.titulo || 'Sin Actividad';
+                }
+            }
+        });
+
+        let equiposUnicos = Object.keys(tagDic).sort();
         const uVal = document.getElementById('f_ubi') ? document.getElementById('f_ubi').value : 'ALL';
 
-        // 2. Mapear las OTs ejecutadas por Equipo y Semana
         let actPorEquipo = {};
         equiposUnicos.forEach(tag => actPorEquipo[tag] = {});
-        
+
         data.forEach(d => {
             if(d.tag && actPorEquipo[d.tag] && d.semana !== "S/N") {
                 let semNum = parseInt(d.semana);
                 if(!isNaN(semNum)) {
-                    // Guardamos el estado y el ID para poder hacer click
                     actPorEquipo[d.tag][semNum] = { status: d.status, id: d.key_id };
                 }
             }
         });
 
-        // 3. Generar la tabla HTML (Semanas de la 1 a la 52)
-        let html = `<table class="pm-table"><thead><tr><th class="pm-tag-col">Equipo / TAG (${uVal})</th>`;
+        let html = `<table class="pm-table"><thead><tr><th class="pm-tag-col">TAG - (TÍTULO ACTIVIDAD) [Línea: ${uVal}]</th>`;
         for(let i = 1; i <= 52; i++) { html += `<th>S${i}</th>`; }
         html += `</tr></thead><tbody>`;
 
         equiposUnicos.forEach(tag => {
-            let titleTag = tag.length > 35 ? tag.substring(0,32) + '...' : tag;
-            html += `<tr><td class="pm-tag-col" title="${tag}">${titleTag}</td>`;
-            
+            let etiquetaCompleta = `${tag} - (${tagDic[tag]})`;
+            let titleTag = etiquetaCompleta.length > 50 ? etiquetaCompleta.substring(0, 47) + '...' : etiquetaCompleta;
+
+            html += `<tr><td class="pm-tag-col" title="${etiquetaCompleta}">${titleTag}</td>`;
+
             let frecData = baseFrecuencias[tag] || { frecuencia: 0, ultima_semana: 0 };
-            
+
             for(let sem = 1; sem <= 52; sem++) {
                 let cellHtml = ``;
                 let isPlanned = false;
-                
-                // Lógica de proyección de frecuencia
+
                 if (frecData.frecuencia > 0) {
                     if ((sem - frecData.ultima_semana) % frecData.frecuencia === 0 && sem >= frecData.ultima_semana) {
                         isPlanned = true;
                     }
                 }
 
-                // ¿Hay una OT real en esta semana para este TAG?
                 let otReal = actPorEquipo[tag][sem];
-                
+
                 if (otReal) {
                     let cssClass = otReal.status === 'realizada' ? 'pm-ok' : (otReal.status === 'en proceso' ? 'pm-proc' : 'pm-pend');
                     let icon = otReal.status === 'realizada' ? '✓' : '!';
