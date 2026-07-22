@@ -1,0 +1,4 @@
+pandas
+openpyxl
+Office365-REST-Python-Client
+Pillow
