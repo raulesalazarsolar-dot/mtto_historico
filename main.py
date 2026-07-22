@@ -8,6 +8,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from PIL import Image
 
+# Librerías para cruce de datos
+import pandas as pd
+
 # Librerías de SharePoint
 from office365.sharepoint.client_context import ClientContext
 from office365.runtime.auth.user_credential import UserCredential
@@ -24,7 +27,102 @@ PASSWORD = os.environ.get("SP_PASSWORD", "dEbit.spLiT+9")
 OUTPUT_HTML = "index.html"
 
 # ==========================================
-# 2. UTILIDADES Y "SABUESO DE FOTOS"
+# 2. PROCESAMIENTO EXCEL (PLAN MATRIZ SAP)
+# ==========================================
+def procesar_bases_sap():
+    print("⏳ Leyendo Excel de Equipos y OTs SAP para el Plan Matriz...")
+    try:
+        # 1. Leer archivo de Equipos
+        df_eq = pd.read_excel('Copia de EVR-06-01 Equipos Críticos Planta Masas (5).xlsx', sheet_name='Clasificación ABC')
+
+        def limpiar_codigo(codigo):
+            c = str(codigo).strip().upper()
+            if c in ['NAN', 'NONE', 'NAT', '']: return 'SIN_EQUIPO'
+            if c.endswith('.0'): c = c[:-2]
+            return c.lstrip('0')
+
+        df_eq['Eq'] = df_eq.iloc[:, 1].apply(limpiar_codigo)
+        df_eq['Nom'] = df_eq.iloc[:, 2].astype(str).str.strip()
+        df_eq['UbiSAP'] = df_eq.iloc[:, 3].astype(str).str.strip()
+        df_eq['UbiSP'] = df_eq.iloc[:, 6].astype(str).str.strip()
+        df_eq['Clase'] = df_eq.iloc[:, 14].astype(str).str.strip().str.upper()
+
+        # Generar Mapa Traductor SP -> SAP
+        mapa_sp_sap = {}
+        for _, r in df_eq.iterrows():
+            usp = r['UbiSP'].upper()
+            if usp and usp != 'NAN':
+                mapa_sp_sap[usp] = r['UbiSAP']
+
+        # Filtro para la jerarquía SAP
+        mapa_eq = df_eq[df_eq['Clase'].isin(['A','B','C'])][['Eq','Nom','UbiSAP','Clase']].drop_duplicates(subset=['Eq'])
+        mapa_eq = mapa_eq[mapa_eq['Eq'] != 'SIN_EQUIPO']
+
+        # 2. Leer archivo de OTs SAP
+        df_ot = pd.read_excel('OT 2025 A 22.07.26.xlsx', dtype={'Equipo': str})
+        df_ot['Eq'] = df_ot['Equipo'].apply(limpiar_codigo)
+
+        # Cruzar
+        df_ot_cruzado = pd.merge(df_ot, mapa_eq, on='Eq', how='inner')
+
+        # Fechas
+        df_ot_cruzado['Fecha'] = pd.to_datetime(df_ot_cruzado['Inic.prog.'], errors='coerce', dayfirst=True)
+        df_ot_cruzado = df_ot_cruzado.dropna(subset=['Fecha'])
+        df_ot_cruzado['Semana'] = df_ot_cruzado['Fecha'].dt.isocalendar().week.astype(int)
+        df_ot_cruzado['Año'] = df_ot_cruzado['Fecha'].dt.year.astype(int)
+        df_ot_cruzado = df_ot_cruzado[df_ot_cruzado['Año'].isin([2025, 2026])]
+
+        def det_st(st):
+            s = str(st).upper()
+            if 'CERR' in s or 'CTEC' in s: return 'realizada'
+            if 'LIB.' in s or 'TRAB' in s: return 'en proceso'
+            return 'pendiente'
+
+        df_ot_cruzado['status_limpio'] = df_ot_cruzado['Stat.sist.'].apply(det_st)
+
+        matriz_sap = { '2025': {'A':{}, 'B':{}, 'C':{}}, '2026': {'A':{}, 'B':{}, 'C':{}} }
+
+        # Poblar esqueleto para que aparezcan equipos sin OTs
+        for _, r in mapa_eq.iterrows():
+            c = r['Clase']
+            u = str(r['UbiSAP']).strip()
+            if u.lower() in ['nan', 'none', '']: u = 'Sin Ubicación Asignada'
+            nom = str(r['Nom'])
+            eq_disp = f"{r['Eq']} - {nom}" if nom.lower() != 'nan' else str(r['Eq'])
+
+            for a in ['2025', '2026']:
+                if u not in matriz_sap[a][c]: matriz_sap[a][c][u] = {}
+                if eq_disp not in matriz_sap[a][c][u]: matriz_sap[a][c][u][eq_disp] = {}
+
+        # Insertar datos de OTs SAP en el esqueleto
+        for _, row in df_ot_cruzado.iterrows():
+            a = str(row['Año'])
+            c = row['Clase']
+            u = str(row['UbiSAP']).strip()
+            if u.lower() in ['nan', 'none', '']: u = 'Sin Ubicación Asignada'
+            nom = str(row['Nom'])
+            eq_disp = f"{row['Eq']} - {nom}" if nom.lower() != 'nan' else str(row['Eq'])
+            sem = str(row['Semana'])
+
+            if sem not in matriz_sap[a][c][u][eq_disp]: matriz_sap[a][c][u][eq_disp][sem] = []
+
+            matriz_sap[a][c][u][eq_disp][sem].append({
+                "id": str(row['Orden']),
+                "ot": str(row['Orden']),
+                "titulo": str(row['Texto breve']).replace('"', '').replace("'", ""),
+                "fecha_prog": row['Fecha'].strftime('%Y-%m-%d'),
+                "status": row['status_limpio']
+            })
+
+        print("✅ Base SAP procesada. Mapeo SP->SAP creado exitosamente.")
+        return matriz_sap, mapa_sp_sap
+
+    except Exception as e:
+        print(f"❌ Error procesando Excel SAP: {e}")
+        return {}, {}
+
+# ==========================================
+# 3. UTILIDADES Y "SABUESO DE FOTOS"
 # ==========================================
 def limpiar(val):
     if val is None: return ""
@@ -60,7 +158,7 @@ def descargar_foto_por_url(ctx, url):
         if len(file_content.getvalue()) > 0:
             with Image.open(file_content) as img:
                 if img.mode != "RGB": img = img.convert("RGB")
-                img.thumbnail((400, 400)) # Compresión para web
+                img.thumbnail((400, 400)) # Compresión
                 buf = io.BytesIO()
                 img.save(buf, format='JPEG', quality=60)
                 return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
@@ -87,17 +185,17 @@ def extraer_foto_columna(ctx, p, col_name, item_id):
     return img_b64
 
 # ==========================================
-# 3. EXTRACCIÓN PRINCIPAL (SHAREPOINT API)
+# 4. EXTRACCIÓN PRINCIPAL (SHAREPOINT API)
 # ==========================================
 def main():
     try:
+        matriz_sap_json, mapa_sp_sap = procesar_bases_sap()
+
         print("🚀 INICIANDO EXTRACCIÓN DIRECTA DESDE SHAREPOINT...")
-        
         ctx = ClientContext(SITE_URL).with_credentials(UserCredential(USERNAME, PASSWORD))
         sp_list = ctx.web.lists.get_by_title(LIST_NAME)
         
         print("   ⏳ Solicitando registros y adjuntos...")
-        
         columnas_req = [
             "Id", "Title", "LinkTitle", "field_2", "field_3", "field_4", 
             "field_5", "field_6", "field_7", "Responsable", "field_10", 
@@ -122,14 +220,11 @@ def main():
             p = item.properties
             
             semana_val = limpiar(p.get("field_1"))
-            # Genera dinámicamente una lista de strings desde "3" hasta "25"
             semanas_permitidas = [str(i) for i in range(3, 26)] 
-            
             if semana_val not in semanas_permitidas:
                 continue
 
             item_id = int(p.get("Id", 0))
-
             planta_raw = limpiar(p.get("Planta")).lower()
             planta_final = "carne" if "carne" in planta_raw else "masas"
 
@@ -150,7 +245,6 @@ def main():
             else: crit_final = "Sin Asignar"
 
             colab_raw = limpiar(p.get("Colaborador")).strip().title()
-
             clase_str = limpiar(p.get("ClaseM")).title()
             clase_final = clase_str if clase_str and clase_str.lower() != "none" else "General"
 
@@ -161,10 +255,8 @@ def main():
             dotacion_val = limpiar(p.get("CantidadPersonas"))
             
             hh_raw = p.get("HH")
-            try:
-                hh_val = float(str(hh_raw).replace(',', '.')) if hh_raw else 0.0
-            except:
-                hh_val = 0.0
+            try: hh_val = float(str(hh_raw).replace(',', '.')) if hh_raw else 0.0
+            except: hh_val = 0.0
 
             key_id = f"MTTO_{item_id}"
             db_json[key_id] = {
@@ -177,7 +269,7 @@ def main():
                 "ejecutor": limpiar(p.get("Responsable")) or "Sin Asignar",
                 "criticidad": crit_final,
                 "colaborador": colab_raw or "Interno",
-                "ubicacion": limpiar(p.get("field_5")),
+                "ubicacion": limpiar(p.get("field_5")), # Esta es la Ubicacion de SharePoint (Col G)
                 "sub_ubi": limpiar(p.get("field_6")),
                 "ot": limpiar(p.get("field_7")),
                 "zona": limpiar(p.get("Zona")),
@@ -201,15 +293,7 @@ def main():
             }
             
         print("\n ✅ Procesamiento finalizado. Construyendo HTML...")
-        
-        # --- BASE DE FRECUENCIAS MOCK (Reemplazar luego con datos reales si es necesario) ---
-        db_frecuencias = {
-            "L1-AMASADORA-01": {"frecuencia": 4, "ultima_semana": 3},
-            "L2-HORNO-02": {"frecuencia": 12, "ultima_semana": 5},
-            "L1-CINTA-05": {"frecuencia": 2, "ultima_semana": 20},
-        }
-
-        generar_html_moderno(db_json, db_frecuencias)
+        generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap)
 
     except Exception as e: 
         print(f"\n❌ Error Fatal: {e}")
@@ -217,9 +301,9 @@ def main():
         traceback.print_exc()
 
 # ==========================================
-# 4. GENERADOR HTML
+# 5. GENERADOR HTML FRONTEND
 # ==========================================
-def generar_html_moderno(db_json, db_frecuencias):
+def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
     fecha_actual = datetime.now(ZoneInfo("America/Santiago")).strftime("%d/%m/%Y %H:%M")
     
     html_template = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Dashboard Mantenimiento</title>
@@ -330,10 +414,7 @@ def generar_html_moderno(db_json, db_frecuencias):
         .dm-close:hover { opacity: 1; transform: scale(1.1); }
         .dm-body { padding: 0; overflow-y: auto; flex: 1; background: var(--bg); }
         .dm-table { width: 100%; border-collapse: collapse; background: white; font-size: 0.9rem; text-align: left; }
-        
         .dm-table th { background: #f8fafc; padding: 15px 20px; font-weight: 700; color: var(--secondary); border-bottom: 2px solid var(--border); position: sticky; top: 0; z-index: 10; text-transform: uppercase; font-size: 0.8rem; cursor: pointer; user-select: none; transition: background 0.2s; }
-        .dm-table th:hover { background: #e2e8f0; }
-        
         .dm-table td { padding: 15px 20px; border-bottom: 1px solid var(--border); color: var(--text); }
         .dm-table tr { transition: background 0.2s; }
         .dm-table tr:hover td { background: #eff6ff; cursor: pointer; }
@@ -346,7 +427,7 @@ def generar_html_moderno(db_json, db_frecuencias):
         .summary-bar-bg { width:100%; height:6px; background:#e2e8f0; border-radius:3px; margin-top:8px; overflow:hidden; }
         .summary-bar-fill { height:100%; transition:width 1s cubic-bezier(0.4, 0, 0.2, 1); }
         
-        /* ESTILOS NUEVOS PARA GANTT */
+        /* GANTT TURNOS */
         .gantt-day-col { flex:1; min-width:320px; background:white; border:1px solid var(--border); border-radius:8px; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 2px 4px rgba(0,0,0,0.02); }
         .gantt-day-header { background:var(--secondary); color:white; padding:15px; text-align:center; }
         .gantt-day-title { margin:0; font-size:1.1rem; text-transform:uppercase; font-weight:700; letter-spacing:0.5px;}
@@ -356,20 +437,31 @@ def generar_html_moderno(db_json, db_frecuencias):
         .gantt-card { background:white; border-left:4px solid transparent; padding:10px; margin-bottom:8px; border-radius:6px; font-size:0.8rem; cursor:pointer; box-shadow:0 2px 4px rgba(0,0,0,0.06); transition:transform 0.15s; }
         .gantt-card:hover { transform: translateY(-2px); box-shadow:0 4px 6px rgba(0,0,0,0.1); }
         
-        /* ESTILOS GANTT PLAN MATRIZ */
-        .pm-table { border-collapse: collapse; width: 100%; text-align: center; font-size: 0.75rem; }
+        /* ESTILOS GANTT PLAN MATRIZ (RENOVADO) */
+        .tab-pm { overflow: hidden; border: 1px solid #ccc; background-color: #f1f1f1; border-radius: 8px 8px 0 0; display: flex; }
+        .tab-pm button { background-color: inherit; border: none; outline: none; cursor: pointer; padding: 12px 20px; transition: 0.3s; font-size: 14px; font-weight: bold; color: #555; flex-grow: 1;}
+        .tab-pm button.active { background-color: #2c3e50; color: white; }
+        .year-select-pm { padding: 6px 12px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 1em; font-weight: bold; color: #1a237e; background-color: #fff; cursor: pointer; margin-left:15px; }
+        
+        .pm-table { border-collapse: collapse; width: 100%; font-size: 0.8em; text-align: center; }
         .pm-table th { background: var(--secondary); color: white; padding: 8px 4px; position: sticky; top: 0; z-index: 10; font-weight: 600; min-width: 30px; border: 1px solid #475569; }
-        .pm-table th.pm-tag-col { position: sticky; left: 0; background: var(--primary); z-index: 20; min-width: 250px; text-align: left; padding-left: 15px; }
+        .pm-table th.pm-tag-col { position: sticky; left: 0; background: var(--primary); z-index: 20; min-width: 380px; max-width: 380px; text-align: left; padding-left: 15px; }
         .pm-table td { border: 1px solid var(--border); padding: 0; height: 35px; position: relative; }
-        .pm-table td.pm-tag-col { position: sticky; left: 0; background: #f8fafc; font-weight: 700; text-align: left; padding-left: 15px; z-index: 5; border-right: 2px solid var(--border); color: var(--primary); }
-        .pm-table tr:hover td.pm-tag-col { background: #e2e8f0; }
+        
+        .pm-table .location-row .pm-tag-col { position: sticky; left: 0; background-color: #e8eaf6; color: #1a237e; font-weight: 800; border-top: 3px solid #b0bec5; font-size: 0.95em; text-align: left; padding-left: 15px; z-index: 15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+        .pm-table .location-row td { background-color: #e8eaf6; border-top: 3px solid #b0bec5; }
+        
+        .pm-table .eq-row .pm-tag-col { position: sticky; left: 0; background-color: #fdfdfd; font-weight: 600; color: #333; padding-left: 35px; border-left: 4px solid #1a237e; text-align: left; z-index: 15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+        
+        .pm-table tr:hover .pm-tag-col.loc-bg { background-color: #d1d5db; }
         .pm-table tr:hover { background: #f1f5f9; }
+        
         .pm-cell-inner { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; }
-        .pm-cell-inner:hover { opacity: 0.8; transform: scale(1.1); }
-        .pm-plan { background: #e2e8f0; border-radius: 4px; width: 80%; height: 80%; margin: auto; }
-        .pm-ok { background: #22c55e; border-radius: 4px; width: 80%; height: 80%; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; }
-        .pm-pend { background: #ef4444; border-radius: 4px; width: 80%; height: 80%; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; }
-        .pm-proc { background: #f59e0b; border-radius: 4px; width: 80%; height: 80%; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; }
+        .pm-cell-inner:hover { opacity: 0.8; transform: scale(1.15); }
+        .pm-ok { background: #22c55e; border-radius: 4px; width: 20px; height: 20px; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; position:relative; box-shadow: 0 1px 3px rgba(0,0,0,0.2);}
+        .pm-pend { background: #ef4444; border-radius: 4px; width: 20px; height: 20px; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; position:relative; box-shadow: 0 1px 3px rgba(0,0,0,0.2);}
+        .pm-proc { background: #f59e0b; border-radius: 4px; width: 20px; height: 20px; margin: auto; color: white; display:flex; align-items:center; justify-content:center; font-weight:bold; position:relative; box-shadow: 0 1px 3px rgba(0,0,0,0.2);}
+        .pm-multi { position:absolute; top:-6px; right:-6px; background:#e74c3c; color:white; border-radius:50%; width:12px; height:12px; font-size:9px; display:flex; align-items:center; justify-content:center; font-weight:bold; box-shadow: 0 1px 2px rgba(0,0,0,0.3);}
     </style>
 </head>
 <body>
@@ -402,7 +494,7 @@ def generar_html_moderno(db_json, db_frecuencias):
             <button class="tab-btn" onclick="setView('charts', this)">📊 Análisis y Tendencias</button>
             <button class="tab-btn" onclick="setView('row', this)">📈 ROW</button>
             <button class="tab-btn" onclick="setView('gantt', this)">📅 Gantt / Turnos</button>
-            <button class="tab-btn" onclick="setView('gantt_pm', this)">⚙️ Plan Matriz (Frecuencias)</button>
+            <button class="tab-btn" onclick="setView('gantt_pm', this)">⚙️ Plan Matriz (Integrado)</button>
         </div>
         <div style="display:flex; gap:10px;">
             <button onclick="descargarExcel()" class="btn-clean" style="margin: 0; padding: 8px 15px; width: auto; border-color: #10b981; color: #10b981; display: flex; align-items: center; gap: 8px;" title="Descargar datos filtrados">
@@ -523,15 +615,30 @@ def generar_html_moderno(db_json, db_frecuencias):
         <div id="view_gantt_pm" style="display:none; flex:1; flex-direction:column; overflow:hidden; padding:20px; background:#f8fafc;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-shrink:0;">
                 <h2 style="color:var(--primary); margin:0; font-size:1.5rem;">Plan Matriz de Mantenimiento</h2>
-                <div style="font-size:0.85rem; color:var(--muted);">Filtra por "Línea / Área" en el panel lateral para organizar los equipos.</div>
+                
+                <div style="display:flex; align-items:center; gap: 15px;">
+                    <input type="text" id="search_pm" class="search-input" placeholder="🔍 Buscar Ubicación o Equipo..." onkeyup="filtrarGanttPM()" style="width:250px;">
+                    <div style="display:flex; gap:10px; font-size:0.8rem; font-weight:700;">
+                        <span style="background:#dcfce7; color:#166534; padding:4px 8px; border-radius:4px;">🟩 Realizada</span>
+                        <span style="background:#fef3c7; color:#92400e; padding:4px 8px; border-radius:4px;">🟨 En Proceso</span>
+                        <span style="background:#fee2e2; color:#991b1b; padding:4px 8px; border-radius:4px;">🟥 Pendiente</span>
+                    </div>
+                </div>
             </div>
-            <div style="display:flex; gap:10px; margin-bottom:15px; font-size:0.8rem; font-weight:700;">
-                <span style="background:#e2e8f0; padding:4px 8px; border-radius:4px;">⬛ Planificado (Frecuencia)</span>
-                <span style="background:#dcfce7; color:#166534; padding:4px 8px; border-radius:4px;">🟩 OT Realizada</span>
-                <span style="background:#fef3c7; color:#92400e; padding:4px 8px; border-radius:4px;">🟨 OT En Proceso</span>
-                <span style="background:#fee2e2; color:#991b1b; padding:4px 8px; border-radius:4px;">🟥 OT Pendiente</span>
+            
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0;">
+                <div class="tab-pm">
+                    <button class="tablinks-pm active" onclick="setPmClass('A', this)">Clase A (Críticos)</button>
+                    <button class="tablinks-pm" onclick="setPmClass('B', this)">Clase B</button>
+                    <button class="tablinks-pm" onclick="setPmClass('C', this)">Clase C</button>
+                </div>
+                <select id="pm_year_select" class="year-select-pm" onchange="setPmYear(this.value)">
+                    <option value="2026">2026</option>
+                    <option value="2025">2025</option>
+                </select>
             </div>
-            <div id="gantt_pm_container" style="flex:1; overflow:auto; background:white; border:1px solid var(--border); border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.05);">
+
+            <div id="gantt_pm_container" style="flex:1; overflow:auto; background:white; border:1px solid var(--border); border-top:none; border-radius:0 0 8px 8px; box-shadow:0 2px 4px rgba(0,0,0,0.05);">
                 </div>
         </div>
 
@@ -541,22 +648,27 @@ def generar_html_moderno(db_json, db_frecuencias):
     Chart.register(ChartDataLabels);
     Chart.defaults.plugins.datalabels.display = false; 
 
+    // DATOS DE SHAREPOINT
     const db = __DB_JSON_DATA__;
-    const baseFrecuencias = __FRECUENCIAS_JSON__;
     const records = Object.values(db).sort((a,b) => b.id_real - a.id_real);
     const weeks = [...new Set(records.map(x=>x.semana).filter(x=>x!=="S/N"))].sort((a,b)=>{ let na=parseInt(a), nb=parseInt(b); return (isNaN(na)||isNaN(nb)) ? a.localeCompare(b) : na-nb; });
     
+    // DATOS INTEGRADOS PARA EL PLAN MATRIZ (SAP + TRADUCTOR)
+    const matrizSAP = __MATRIZ_SAP_JSON__;
+    const mapaSpSap = __MAPA_SP_SAP__;
+
     let appState = { statusFilter: 'all', view: 'list' };
     let currentChartData = [];
     let chartInstances = {};
     let currentPlanta = 'masas';
+    let currentPmYear = '2026';
+    let currentPmClass = 'A';
     
     Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
     Chart.defaults.color = '#64748b';
 
     const getAreaResp = (ejecutor) => {
         let ejL = (ejecutor || '').toLowerCase();
-        
         let mecanicos = ['luis lagos', 'luis guajardo', 'rubén carrasco', 'ruben carrasco', 
                          'marcelo rivera', 'vladimir berrios', 'rubén briceño', 'ruben briceño', 
                          'mantenimiento', 'javier cordova', 'nicolás chandia', 'nicolas chandia'];
@@ -565,33 +677,23 @@ def generar_html_moderno(db_json, db_frecuencias):
         if (ejL.includes('autómata') || ejL.includes('automata')) return 'Autómata';
         if (ejL.includes('edward corona') || ejL.includes('frio') || ejL.includes('frío')) return 'Frio';
         if (ejL.includes('infraestructura')) return 'Infraestructura';
-        
         return 'Otros';
     };
 
     function togglePlanta() {
         const cb = document.getElementById('planta_toggle');
         const topBar = document.querySelector('.top-bar');
-        
-        if(cb.checked) {
-            currentPlanta = 'carne';
-            topBar.style.backgroundColor = '#ef4444';
-        } else {
-            currentPlanta = 'masas';
-            topBar.style.backgroundColor = '#0f172a';
-        }
+        if(cb.checked) { currentPlanta = 'carne'; topBar.style.backgroundColor = '#ef4444'; } 
+        else { currentPlanta = 'masas'; topBar.style.backgroundColor = '#0f172a'; }
         applyFilters();
     }
 
     function buildFilters() {
         const fDiv = document.getElementById('filters_dynamic');
-        
         const createSelect = (id, label, options, defValue = 'ALL') => {
             let sel = `<div class="f-group"><label>${label}</label><select id="${id}" onchange="applyFilters()">`;
             sel += `<option value="ALL">Todos</option>`;
-            options.forEach(o => { 
-                if(o) sel += `<option value="${o}" ${o === defValue ? 'selected' : ''}>${o}</option>`; 
-            });
+            options.forEach(o => { if(o) sel += `<option value="${o}" ${o === defValue ? 'selected' : ''}>${o}</option>`; });
             sel += `</select></div>`;
             return sel;
         };
@@ -600,34 +702,15 @@ def generar_html_moderno(db_json, db_frecuencias):
         html += createSelect('f_semana', '📆 Semana', weeks, '25');
         html += createSelect('f_zona', '📍 Zona', [...new Set(records.map(x=>x.zona))].filter(Boolean).sort());
         html += createSelect('f_clase', '🛠️ Clase MTTO', [...new Set(records.map(x=>x.clase))].sort());
-        
         html += createSelect('f_especialidad', '🧑‍🔧 Especialidad', ['Mecánico', 'Autómata', 'Frio', 'Infraestructura', 'Otros'].sort());
-        
         html += `<div class="f-group"><label>👥 Colaborador</label><select id="f_colaborador" onchange="applyFilters()">
-            <option value="ALL">Todos</option>
-            <option value="Interno">Interno</option>
-            <option value="Externo">Externo</option>
-        </select></div>`;
-
+            <option value="ALL">Todos</option><option value="Interno">Interno</option><option value="Externo">Externo</option></select></div>`;
         html += createSelect('f_exec', '👷 Responsable', [...new Set(records.map(x=>x.ejecutor))].sort());
         html += createSelect('f_ubi', '🏭 Línea / Área', [...new Set(records.map(x=>x.ubicacion))].sort());
-        
         html += `<div class="f-group"><label>⚠️ Criticidad</label><select id="f_criticidad" onchange="applyFilters()">
-            <option value="ALL">Todas</option>
-            <option value="Critica">🚨 Crítica</option>
-            <option value="Mayor">🔴 Mayor</option>
-            <option value="Menor">🟢 Menor</option>
-        </select></div>`;
-
+            <option value="ALL">Todas</option><option value="Critica">🚨 Crítica</option><option value="Mayor">🔴 Mayor</option><option value="Menor">🟢 Menor</option></select></div>`;
         html += `<div class="f-group"><label>🚦 Estado</label><select id="f_status" onchange="applyFilters()">
-            <option value="ALL">Todas las OTs</option>
-            <option value="abiertas">Backlog (No Cerradas)</option>
-            <option value="pendiente">Solo Pendientes</option>
-            <option value="en proceso">Solo En Proceso</option>
-            <option value="programado">Solo Programadas</option>
-            <option value="realizada">Solo Cerradas</option>
-        </select></div>`;
-        
+            <option value="ALL">Todas las OTs</option><option value="abiertas">Backlog (No Cerradas)</option><option value="pendiente">Solo Pendientes</option><option value="en proceso">Solo En Proceso</option><option value="programado">Solo Programadas</option><option value="realizada">Solo Cerradas</option></select></div>`;
         fDiv.innerHTML = html;
     }
 
@@ -650,20 +733,13 @@ def generar_html_moderno(db_json, db_frecuencias):
         document.getElementById('view_gantt').style.display = 'none';
         document.getElementById('view_gantt_pm').style.display = 'none';
 
-        if (view === 'list') {
-            document.getElementById('view_list').style.display = 'flex';
-        } else if (view === 'charts') {
-            document.getElementById('view_charts').style.display = 'grid';
-        } else if (view === 'row') {
-            document.getElementById('view_row').style.display = 'flex';
-        } else if (view === 'gantt') {
-            document.getElementById('view_gantt').style.display = 'flex';
-        } else if (view === 'gantt_pm') {
+        if (view === 'list') document.getElementById('view_list').style.display = 'flex';
+        else if (view === 'charts') document.getElementById('view_charts').style.display = 'grid';
+        else if (view === 'row') document.getElementById('view_row').style.display = 'flex';
+        else if (view === 'gantt') document.getElementById('view_gantt').style.display = 'flex';
+        else if (view === 'gantt_pm') {
             document.getElementById('view_gantt_pm').style.display = 'flex';
-            let filtroSemana = document.getElementById('f_semana');
-            if (filtroSemana && filtroSemana.value !== 'ALL') {
-                filtroSemana.value = 'ALL';
-            }
+            drawGanttPM();
         }
         applyFilters();
     }
@@ -678,7 +754,6 @@ def generar_html_moderno(db_json, db_frecuencias):
         const espVal = document.getElementById('f_especialidad') ? document.getElementById('f_especialidad').value : 'ALL';
         const critVal = document.getElementById('f_criticidad') ? document.getElementById('f_criticidad').value : 'ALL';
         const colabVal = document.getElementById('f_colaborador') ? document.getElementById('f_colaborador').value : 'ALL';
-        
         const searchVal = document.getElementById('search_input') ? document.getElementById('search_input').value.toLowerCase().trim() : '';
 
         let topWeekTitle = "Semanas Cargadas: " + (weeks.length > 0 ? weeks.join(', ') : "Ninguna");
@@ -687,17 +762,14 @@ def generar_html_moderno(db_json, db_frecuencias):
 
         return records.filter(d => {
             if (d.planta !== currentPlanta) return false;
-
             if (stVal !== 'ALL') {
                 if (stVal === 'abiertas' && d.status === 'realizada') return false;
                 else if (stVal !== 'abiertas' && d.status !== stVal) return false;
             }
-            
             if (searchVal !== '') {
                 const text = `${d.titulo} ${d.ot} ${d.tag}`.toLowerCase();
                 if (!text.includes(searchVal)) return false;
             }
-
             if (cVal !== 'ALL' && d.clase !== cVal) return false;
             if (eVal !== 'ALL' && d.ejecutor !== eVal) return false;
             if (uVal !== 'ALL' && d.ubicacion !== uVal) return false;
@@ -706,7 +778,6 @@ def generar_html_moderno(db_json, db_frecuencias):
             if (espVal !== 'ALL' && getAreaResp(d.ejecutor) !== espVal) return false;
             if (critVal !== 'ALL' && d.criticidad !== critVal) return false;
             if (colabVal !== 'ALL' && d.colaborador !== colabVal) return false;
-            
             return true;
         });
     }
@@ -731,13 +802,12 @@ def generar_html_moderno(db_json, db_frecuencias):
         else if (appState.view === 'charts') drawCharts(currentChartData);
         else if (appState.view === 'row') drawRowCharts(currentChartData);
         else if (appState.view === 'gantt') drawGantt(currentChartData);
-        else if (appState.view === 'gantt_pm') drawGanttPM(currentChartData);
+        else if (appState.view === 'gantt_pm') drawGanttPM(); // Actualiza PM con SP filtrado
     }
 
     function renderList(data) {
         const container = document.getElementById('list_container');
         container.innerHTML = '';
-        
         data.forEach(d => {
             const item = document.createElement('div');
             item.className = 'list-item';
@@ -746,22 +816,14 @@ def generar_html_moderno(db_json, db_frecuencias):
                 document.querySelectorAll('.list-item').forEach(i=>i.classList.remove('selected'));
                 item.classList.add('selected');
             };
-            
             let stText = '⚠️ PEND'; let stClass = 'st-pend';
             if (d.status === 'realizada') { stText='✅ CERRADA'; stClass='st-ok'; }
             else if (d.status === 'programado') { stText='📅 PROG'; stClass='st-prog'; }
             else if (d.status === 'en proceso') { stText='🔨 PROCESO'; stClass='st-proc'; }
-            
             let idDisplay = d.ot ? `OT: ${d.ot}` : (d.tag ? d.tag : '#' + d.id_real);
-            
-            item.innerHTML = `
-                <div class="li-top"><span>${idDisplay}</span><span>Sem: ${d.semana}</span></div>
+            item.innerHTML = `<div class="li-top"><span>${idDisplay}</span><span>Sem: ${d.semana}</span></div>
                 <div class="li-title">${d.titulo}</div>
-                <div class="li-btm">
-                    <span class="tag ${stClass}">${stText}</span>
-                    <span style="color:var(--muted); font-weight:700;">👷 ${d.ejecutor.split(' ')[0]}</span>
-                </div>
-            `;
+                <div class="li-btm"><span class="tag ${stClass}">${stText}</span><span style="color:var(--muted); font-weight:700;">👷 ${d.ejecutor.split(' ')[0]}</span></div>`;
             container.appendChild(item);
         });
     }
@@ -783,19 +845,13 @@ def generar_html_moderno(db_json, db_frecuencias):
         let durText = d.duracion ? `<span title="Tiempo de Ejecución (h)">⏱️ Ejecución: ${d.duracion}h</span>` : '';
         let dotText = d.dotacion ? `<span title="Dotación (Cantidad de Personas)">👥 Dotación: ${d.dotacion}</span>` : '';
         let hhText = d.hh > 0 ? `<span title="Duración Total HH">⌛ Total: ${d.hh % 1 === 0 ? d.hh : d.hh.toFixed(1)} HH</span>` : '';
-        
         let extraHtml = [durText, dotText, hhText].filter(Boolean).join('<span style="color:#cbd5e1; margin:0 4px;">|</span>');
         
         const extraDiv = document.getElementById('d_extra_info');
-        if(extraHtml) {
-            extraDiv.style.display = 'flex';
-            extraDiv.innerHTML = extraHtml;
-        } else {
-            extraDiv.style.display = 'none';
-        }
+        if(extraHtml) { extraDiv.style.display = 'flex'; extraDiv.innerHTML = extraHtml; } 
+        else extraDiv.style.display = 'none';
 
-        let crit = d.criticidad;
-        let pl = '';
+        let crit = d.criticidad; let pl = '';
         if(crit === 'Critica') pl='<span class="prio-flag p-crit">🚨 CRÍTICA</span>';
         else if(crit === 'Mayor') pl='<span class="prio-flag p-alta">🔴 MAYOR</span>';
         else if(crit === 'Menor') pl='<span class="prio-flag p-baja">🟢 MENOR</span>';
@@ -805,7 +861,6 @@ def generar_html_moderno(db_json, db_frecuencias):
         const grid = document.getElementById('d_grid');
         grid.innerHTML = '';
         const createItem = (label, val) => `<div class="dg-item"><small>${label}</small><strong>${val||'--'}</strong></div>`;
-        
         grid.innerHTML += createItem('🛠️ Clase MTTO', d.clase);
         grid.innerHTML += createItem('📍 Zona', d.zona);
         grid.innerHTML += createItem('👷 Responsable', d.ejecutor);
@@ -824,29 +879,16 @@ def generar_html_moderno(db_json, db_frecuencias):
 
         document.getElementById('box_obs1').style.display = 'block';
         document.getElementById('d_obs').innerText = d.observacion || 'Sin observaciones registradas.';
-        
         if(d.obs2) { document.getElementById('box_obs2').style.display = 'block'; document.getElementById('d_obs2').innerText = d.obs2; }
         else { document.getElementById('box_obs2').style.display = 'none'; }
         
         const imgContainer = document.getElementById('d_img_container');
         let htmlImgs = '<div class="gallery-grid">';
-        let hasImgs = false;
-
-        if (d.img_antes) {
-            htmlImgs += `<div class="gal-box"><span>📸 Antes</span><img src="${d.img_antes}" class="gal-img" onclick="openModal(this.src)"></div>`;
-            hasImgs = true;
-        } else {
-            htmlImgs += `<div class="gal-box"><span>📸 Antes</span><div style="height:150px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-style:italic; font-weight:600; font-size:0.9rem;">Sin foto "Antes"</div></div>`;
-        }
-
-        if (d.img_despues) {
-            htmlImgs += `<div class="gal-box"><span>📸 Después</span><img src="${d.img_despues}" class="gal-img" onclick="openModal(this.src)"></div>`;
-            hasImgs = true;
-        } else {
-            htmlImgs += `<div class="gal-box"><span>📸 Después</span><div style="height:150px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-style:italic; font-weight:600; font-size:0.9rem;">Sin foto "Después"</div></div>`;
-        }
+        if (d.img_antes) htmlImgs += `<div class="gal-box"><span>📸 Antes</span><img src="${d.img_antes}" class="gal-img" onclick="openModal(this.src)"></div>`;
+        else htmlImgs += `<div class="gal-box"><span>📸 Antes</span><div style="height:150px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-style:italic; font-weight:600; font-size:0.9rem;">Sin foto</div></div>`;
+        if (d.img_despues) htmlImgs += `<div class="gal-box"><span>📸 Después</span><img src="${d.img_despues}" class="gal-img" onclick="openModal(this.src)"></div>`;
+        else htmlImgs += `<div class="gal-box"><span>📸 Después</span><div style="height:150px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-style:italic; font-weight:600; font-size:0.9rem;">Sin foto</div></div>`;
         htmlImgs += '</div>';
-
         imgContainer.innerHTML = htmlImgs;
         document.getElementById('d_gallery_sec').style.display = 'flex';
     }
@@ -856,105 +898,49 @@ def generar_html_moderno(db_json, db_frecuencias):
         document.getElementById('modal').style.display = 'flex';
     }
 
-    let currentSortCol = -1;
-    let currentSortDir = 'asc';
-
+    let currentSortCol = -1; let currentSortDir = 'asc';
     function sortModalTable(colIndex, thElement) {
-        const table = document.querySelector('.dm-table');
-        const tbody = table.querySelector('tbody');
-        const rows = Array.from(tbody.querySelectorAll('tr'));
-
-        table.querySelectorAll('th').forEach(th => {
-            th.innerText = th.innerText.replace(/ [▼▲]/g, ' ↕');
-        });
-
-        if (currentSortCol === colIndex) {
-            currentSortDir = currentSortDir === 'asc' ? 'desc' : 'asc';
-        } else {
-            currentSortDir = 'asc';
-            currentSortCol = colIndex;
-        }
-
+        const table = document.querySelector('.dm-table'); const tbody = table.querySelector('tbody'); const rows = Array.from(tbody.querySelectorAll('tr'));
+        table.querySelectorAll('th').forEach(th => th.innerText = th.innerText.replace(/ [▼▲]/g, ' ↕'));
+        if (currentSortCol === colIndex) currentSortDir = currentSortDir === 'asc' ? 'desc' : 'asc'; else { currentSortDir = 'asc'; currentSortCol = colIndex; }
         thElement.innerText = thElement.innerText.replace(' ↕', currentSortDir === 'asc' ? ' ▲' : ' ▼');
-
         rows.sort((a, b) => {
-            const aCol = a.querySelectorAll('td')[colIndex];
-            const bCol = b.querySelectorAll('td')[colIndex];
-            
+            const aCol = a.querySelectorAll('td')[colIndex]; const bCol = b.querySelectorAll('td')[colIndex];
             if(!aCol || !bCol || a.cells.length === 1) return 0;
-
-            let aText = aCol.innerText.trim().toLowerCase();
-            let bText = bCol.innerText.trim().toLowerCase();
-
-            let aNum = parseFloat(aText);
-            let bNum = parseFloat(bText);
-
-            if (!isNaN(aNum) && !isNaN(bNum)) {
-                return currentSortDir === 'asc' ? aNum - bNum : bNum - aNum;
-            }
-
+            let aText = aCol.innerText.trim().toLowerCase(); let bText = bCol.innerText.trim().toLowerCase();
+            let aNum = parseFloat(aText); let bNum = parseFloat(bText);
+            if (!isNaN(aNum) && !isNaN(bNum)) return currentSortDir === 'asc' ? aNum - bNum : bNum - aNum;
             if (aText < bText) return currentSortDir === 'asc' ? -1 : 1;
             if (aText > bText) return currentSortDir === 'asc' ? 1 : -1;
             return 0;
         });
-
         rows.forEach(row => tbody.appendChild(row));
     }
 
     function showDataModal(title, filterFn, colProp = 'ubicacion') {
         let colHeader = colProp === 'clase' ? 'Clase de Actividad' : 'Ubicación';
-        
-        let html = `<div class="dm-header">
-            <h3>📊 Desglose: ${title}</h3>
-            <button class="dm-close" onclick="document.getElementById('data_modal').style.display='none'">&times;</button>
-        </div>
-        <div class="dm-body">
-            <table class="dm-table">
-                <thead>
-                    <tr>
-                        <th onclick="sortModalTable(0, this)" title="Click para ordenar">OT / TAG ↕</th>
-                        <th onclick="sortModalTable(1, this)" title="Click para ordenar">${colHeader} ↕</th>
-                        <th onclick="sortModalTable(2, this)" title="Click para ordenar">Título / Actividad ↕</th>
-                        <th onclick="sortModalTable(3, this)" title="Click para ordenar">Responsable ↕</th>
-                        <th onclick="sortModalTable(4, this)" title="Click para ordenar">Estado ↕</th>
-                        <th onclick="sortModalTable(5, this)" title="Click para ordenar">Observación ↕</th>
-                    </tr>
-                </thead>
-                <tbody>`;
+        let html = `<div class="dm-header"><h3>📊 Desglose: ${title}</h3><button class="dm-close" onclick="document.getElementById('data_modal').style.display='none'">&times;</button></div>
+        <div class="dm-body"><table class="dm-table"><thead><tr>
+            <th onclick="sortModalTable(0, this)">OT / TAG ↕</th><th onclick="sortModalTable(1, this)">${colHeader} ↕</th><th onclick="sortModalTable(2, this)">Título / Actividad ↕</th><th onclick="sortModalTable(3, this)">Responsable ↕</th><th onclick="sortModalTable(4, this)">Estado ↕</th><th onclick="sortModalTable(5, this)">Observación ↕</th>
+        </tr></thead><tbody>`;
 
         let datosFiltrados = currentChartData.filter(filterFn);
+        datosFiltrados.sort((a, b) => { let valA = a[colProp] ? String(a[colProp]).toLowerCase() : ""; let valB = b[colProp] ? String(b[colProp]).toLowerCase() : ""; return valA.localeCompare(valB); });
         
-        datosFiltrados.sort((a, b) => {
-            let valA = a[colProp] ? String(a[colProp]).toLowerCase() : "";
-            let valB = b[colProp] ? String(b[colProp]).toLowerCase() : "";
-            return valA.localeCompare(valB);
-        });
-
         let found = datosFiltrados.length > 0;
-        
         datosFiltrados.forEach(d => {
             let stColor = d.status === 'realizada' ? '#166534' : (d.status === 'pendiente' ? '#991b1b' : (d.status === 'en proceso' ? '#92400e' : '#075985'));
             let idDisplay = d.ot ? d.ot : (d.tag ? d.tag : '#' + d.id_real);
             let obsText = d.observacion ? (d.observacion.length > 45 ? d.observacion.substring(0, 42) + '...' : d.observacion) : '-';
-            let colText = d[colProp] || '-';
-
             html += `<tr onclick="document.getElementById('data_modal').style.display='none'; document.getElementById('btn_tab_list').click(); setTimeout(() => renderDetail('${d.key_id}'), 100);">
-                <td style="font-weight:700;">${idDisplay}</td>
-                <td>${colText}</td>
-                <td>${d.titulo}</td>
-                <td>${d.ejecutor.split(' ')[0]}</td>
-                <td style="color:${stColor}; font-weight:700; text-transform:uppercase;">${d.status}</td>
-                <td style="max-width: 250px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${d.observacion}">${obsText}</td>
-            </tr>`;
+                <td style="font-weight:700;">${idDisplay}</td><td>${d[colProp]||'-'}</td><td>${d.titulo}</td><td>${d.ejecutor.split(' ')[0]}</td><td style="color:${stColor}; font-weight:700; text-transform:uppercase;">${d.status}</td>
+                <td style="max-width: 250px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${d.observacion}">${obsText}</td></tr>`;
         });
-
-        if (!found) html += `<tr><td colspan="6" style="text-align:center; padding: 30px; color:var(--muted);">No hay OTs para esta selección</td></tr>`;
+        if (!found) html += `<tr><td colspan="6" style="text-align:center; padding: 30px; color:var(--muted);">No hay OTs</td></tr>`;
         html += `</tbody></table></div>`;
         document.getElementById('data_modal_content').innerHTML = html;
         document.getElementById('data_modal').style.display = 'flex';
-        
-        currentSortCol = -1;
-        currentSortDir = 'asc';
+        currentSortCol = -1; currentSortDir = 'asc';
     }
 
     function getFreshCanvas(id) {
@@ -969,174 +955,60 @@ def generar_html_moderno(db_json, db_frecuencias):
         const btn = document.getElementById('btn_descargar_row');
         const originalText = btn.innerHTML;
         btn.innerHTML = "⏳ Generando Imagen...";
-        
-        const container = document.getElementById('view_row');
-        
-        html2canvas(container, { scale: 2, backgroundColor: "#f1f5f9" }).then(canvas => {
-            let link = document.createElement('a');
-            link.download = 'Dashboard_ROW.png';
-            link.href = canvas.toDataURL('image/png');
-            link.click();
-            btn.innerHTML = originalText;
-        }).catch(err => {
-            alert("Error al capturar la pantalla.");
-            btn.innerHTML = originalText;
-        });
+        html2canvas(document.getElementById('view_row'), { scale: 2, backgroundColor: "#f1f5f9" }).then(canvas => {
+            let link = document.createElement('a'); link.download = 'Dashboard_ROW.png'; link.href = canvas.toDataURL('image/png'); link.click(); btn.innerHTML = originalText;
+        }).catch(err => { alert("Error al capturar la pantalla."); btn.innerHTML = originalText; });
     }
 
     function descargarExcel() {
-        if (!currentChartData || currentChartData.length === 0) {
-            alert("No hay datos para exportar con los filtros actuales.");
-            return;
-        }
-
+        if (!currentChartData || currentChartData.length === 0) return alert("No hay datos para exportar.");
         const datosExcel = currentChartData.map(d => ({
-            "Levantamiento": d.f_lev,
-            "Cierre": d.f_cie,
-            "Actividad": d.actividad,
-            "Planta": d.planta,
-            "Clase": d.clase,
-            "Zona": d.zona,
-            "Ubicación": d.ubicacion,
-            "Sub Ubicación": d.sub_ubi,
-            "OT": d.ot,
-            "Criticidad": d.criticidad,
-            "Colaborador": d.colaborador,
-            "Ejecutor": d.ejecutor,
-            "Status": d.status.toUpperCase(),
-            "Observación": d.observacion,
-            "Semana": d.semana,
-            "Tiempo Ejecución (h)": d.duracion,
-            "Dotación": d.dotacion,
-            "Duración Total (HH)": d.hh,
-            "Día Planificado": d.dia,
-            "Código Turno 1": d.tecnico,
-            "Código Turno 2": d.tecnico1,
-            "Código Turno 3": d.tecnico2
+            "Levantamiento": d.f_lev, "Cierre": d.f_cie, "Actividad": d.actividad, "Planta": d.planta, "Clase": d.clase, "Zona": d.zona,
+            "Ubicación": d.ubicacion, "Sub Ubicación": d.sub_ubi, "OT": d.ot, "Criticidad": d.criticidad, "Colaborador": d.colaborador,
+            "Ejecutor": d.ejecutor, "Status": d.status.toUpperCase(), "Observación": d.observacion, "Semana": d.semana, "Tiempo Ejecución (h)": d.duracion,
+            "Dotación": d.dotacion, "Duración Total (HH)": d.hh, "Día Planificado": d.dia, "Código Turno 1": d.tecnico, "Código Turno 2": d.tecnico1, "Código Turno 3": d.tecnico2
         }));
-
         const worksheet = XLSX.utils.json_to_sheet(datosExcel);
         const workbook = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(workbook, worksheet, "Base de Datos");
-
-        const anchos = [
-            { wch: 12 }, { wch: 12 }, { wch: 40 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 20 }, 
-            { wch: 20 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 20 }, { wch: 15 }, { wch: 50 }, 
-            { wch: 10 }, { wch: 15 }, { wch: 10 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }
-        ];
-        worksheet['!cols'] = anchos;
-
-        let fechaEx = new Date().toISOString().split('T')[0];
-        XLSX.writeFile(workbook, `Reporte_MTTO_${fechaEx}.xlsx`);
+        XLSX.writeFile(workbook, `Reporte_MTTO_${new Date().toISOString().split('T')[0]}.xlsx`);
     }
 
     function descargarHTML() {
-        var htmlContent = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
-        var blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
-        var url = URL.createObjectURL(blob);
         var a = document.createElement('a');
-        a.href = url;
-        var fecha = new Date().toISOString().split('T')[0];
-        a.download = 'Dashboard_Mantenimiento_' + fecha + '.html';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        a.href = URL.createObjectURL(new Blob(['<!DOCTYPE html>\\n' + document.documentElement.outerHTML], { type: 'text/html;charset=utf-8' }));
+        a.download = 'Dashboard_Mantenimiento_' + new Date().toISOString().split('T')[0] + '.html';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
     }
 
-    const isAseoAct = (d) => {
-        let claseL = (d.clase || '').toLowerCase();
-        return claseL.includes('aseo') || 
-               claseL.includes('limpieza') ||
-               claseL.includes('sanitizacion y seguridad') ||
-               claseL.includes('sanitización y seguridad');
-    };
-
-    const getPLoc = (d) => {
-        let textMatch = (d.ubicacion + " " + (d.sub_ubi || "") + " " + (d.titulo || "")).toLowerCase();
-        if (textMatch.includes('l1') || textMatch.includes('panadería 1') || textMatch.includes('panaderia 1')) return 'L1';
-        if (textMatch.includes('l2') || textMatch.includes('panadería 2') || textMatch.includes('panaderia 2')) return 'L2';
-        if (textMatch.includes('l3') || textMatch.includes('panadería 3') || textMatch.includes('panaderia 3')) return 'L3';
-        if (textMatch.includes('l4') || textMatch.includes('panadería 4') || textMatch.includes('panaderia 4')) return 'L4';
-        if (textMatch.includes('l5') || textMatch.includes('panadería 5') || textMatch.includes('panaderia 5')) return 'L5';
-        return null;
-    };
-
-    const getDLoc = (d) => {
-        let textMatch = (d.ubicacion + " " + (d.sub_ubi || "") + " " + (d.titulo || "")).toLowerCase();
-        if (textMatch.includes('pizza')) return 'Pizza';
-        if (textMatch.includes('bollerí') || textMatch.includes('bolleri')) return 'Bolleria';
-        if (textMatch.includes('empanada')) return 'Empanadas';
-        return null;
-    };
+    const isAseoAct = (d) => { let l = (d.clase || '').toLowerCase(); return l.includes('aseo') || l.includes('limpieza') || l.includes('sanitizacion'); };
+    const getPLoc = (d) => { let t = (d.ubicacion + " " + (d.sub_ubi || "") + " " + (d.titulo || "")).toLowerCase(); if(t.includes('l1') || t.includes('panadería 1') || t.includes('panaderia 1')) return 'L1'; if (t.includes('l2') || t.includes('panaderia 2')) return 'L2'; if (t.includes('l3') || t.includes('panaderia 3')) return 'L3'; if (t.includes('l4') || t.includes('panaderia 4')) return 'L4'; if (t.includes('l5') || t.includes('panaderia 5')) return 'L5'; return null; };
+    const getDLoc = (d) => { let t = (d.ubicacion + " " + (d.sub_ubi || "") + " " + (d.titulo || "")).toLowerCase(); if(t.includes('pizza')) return 'Pizza'; if(t.includes('bolleri')) return 'Bolleria'; if(t.includes('empanada')) return 'Empanadas'; return null; };
 
     function drawCharts(data) {
         if(!data) return;
-
         let stats = { ok:0, pend:0, proc:0, prog:0, ex:{}, loc:{}, wCounts:{}, cCounts:{} };
-        let totAseo = 0, okAseo = 0, hhAseo = 0;
-        let totMtto = 0, okMtto = 0, hhMtto = 0;
-        let totGen = data.length, okGen = 0, hhGen = 0;
-        
-        let statsArea = {
-            'Mecánico': { total: 0, ok: 0, proc: 0, pend: 0 },
-            'Autómata': { total: 0, ok: 0, proc: 0, pend: 0 },
-            'Frio': { total: 0, ok: 0, proc: 0, pend: 0 },
-            'Infraestructura': { total: 0, ok: 0, proc: 0, pend: 0 }
-        };
+        let totAseo = 0, okAseo = 0, hhAseo = 0; let totMtto = 0, okMtto = 0, hhMtto = 0; let totGen = data.length, okGen = 0, hhGen = 0;
+        let statsArea = { 'Mecánico': { total: 0, ok: 0, proc: 0, pend: 0 }, 'Autómata': { total: 0, ok: 0, proc: 0, pend: 0 }, 'Frio': { total: 0, ok: 0, proc: 0, pend: 0 }, 'Infraestructura': { total: 0, ok: 0, proc: 0, pend: 0 } };
 
         weeks.forEach(w => stats.wCounts[w] = {total:0, ok:0});
-        
         data.forEach(d => {
-            let isOk = (d.status === 'realizada');
-            let isProc = (d.status === 'en proceso');
-            let isProg = (d.status === 'programado');
-            let isPend = (d.status === 'pendiente');
+            let isOk = (d.status === 'realizada'); let isProc = (d.status === 'en proceso'); let isProg = (d.status === 'programado'); let isPend = (d.status === 'pendiente');
+            let hhActual = parseFloat(d.hh) || 0; hhGen += hhActual;
 
-            let hhActual = parseFloat(d.hh) || 0;
-            hhGen += hhActual;
-
-            if(isOk) { stats.ok++; okGen++; }
-            else if(isProg) { stats.prog++; }
-            else if(isProc) { stats.proc++; }
-            else { stats.pend++; }
-            
+            if(isOk) { stats.ok++; okGen++; } else if(isProg) { stats.prog++; } else if(isProc) { stats.proc++; } else { stats.pend++; }
             stats.cCounts[d.clase] = (stats.cCounts[d.clase]||0)+1;
             
-            let isAseo = isAseoAct(d);
-            if(isAseo) {
-                totAseo++;
-                if(isOk) okAseo++;
-                hhAseo += hhActual;
-            } else {
-                totMtto++;
-                if(isOk) okMtto++;
-                hhMtto += hhActual;
-            }
+            if(isAseoAct(d)) { totAseo++; if(isOk) okAseo++; hhAseo += hhActual; } else { totMtto++; if(isOk) okMtto++; hhMtto += hhActual; }
 
-            const e = d.ejecutor || 'Sin Asignar';
-            if(!stats.ex[e]) stats.ex[e]={ok:0, proc:0, pend:0};
-            if(isOk) stats.ex[e].ok++;
-            else if(isProc) stats.ex[e].proc++;
-            else stats.ex[e].pend++; 
+            const e = d.ejecutor || 'Sin Asignar'; if(!stats.ex[e]) stats.ex[e]={ok:0, proc:0, pend:0};
+            if(isOk) stats.ex[e].ok++; else if(isProc) stats.ex[e].proc++; else stats.ex[e].pend++; 
 
-            const l = d.ubicacion || 'Sin Ubicación';
-            if(!stats.loc[l]) stats.loc[l]=0;
-            stats.loc[l]++;
-            
-            if(d.semana!=="S/N" && stats.wCounts[d.semana]) {
-                stats.wCounts[d.semana].total++;
-                if(isOk) stats.wCounts[d.semana].ok++;
-            }
+            const l = d.ubicacion || 'Sin Ubicación'; if(!stats.loc[l]) stats.loc[l]=0; stats.loc[l]++;
+            if(d.semana!=="S/N" && stats.wCounts[d.semana]) { stats.wCounts[d.semana].total++; if(isOk) stats.wCounts[d.semana].ok++; }
             
             let area = getAreaResp(d.ejecutor);
-            
-            if (statsArea[area]) {
-                statsArea[area].total++;
-                if (isOk) statsArea[area].ok++;
-                else if (isProc) statsArea[area].proc++;
-                else statsArea[area].pend++;
-            }
+            if (statsArea[area]) { statsArea[area].total++; if (isOk) statsArea[area].ok++; else if (isProc) statsArea[area].proc++; else statsArea[area].pend++; }
         });
 
         let percAseo = totAseo > 0 ? Math.round((okAseo/totAseo)*100) : 0;
@@ -1147,802 +1019,282 @@ def generar_html_moderno(db_json, db_frecuencias):
         let colMtto = percMtto >= 80 ? '#10b981' : (percMtto >= 40 ? '#f59e0b' : '#ef4444');
         let colGen = percGen >= 80 ? '#1d4ed8' : (percGen >= 40 ? '#f59e0b' : '#ef4444');
 
-        let textHHAseo = hhAseo > 0 ? ' / <b>' + (hhAseo % 1 === 0 ? hhAseo : hhAseo.toFixed(1)) + ' HH necesarias</b>' : "";
-        let textHHMtto = hhMtto > 0 ? ' / <b>' + (hhMtto % 1 === 0 ? hhMtto : hhMtto.toFixed(1)) + ' HH necesarias</b>' : "";
-        let textHHGen = hhGen > 0 ? ' / <b>' + (hhGen % 1 === 0 ? hhGen : hhGen.toFixed(1)) + ' HH necesarias</b>' : "";
-
-        let summaryHtml = `
-            <div class="summary-block">
-                <div class="summary-header">
-                    <span class="summary-title" style="color:#eab308;">🧹 Aseo / Sanitización y Seg.</span>
-                    <span class="summary-perc" style="color:${colAseo};">${percAseo}%</span>
-                </div>
-                <div class="summary-sub">De un total de <b>${totAseo}</b>, <b>${okAseo}</b> realizadas${textHHAseo}</div>
-                <div class="summary-bar-bg">
-                    <div class="summary-bar-fill" style="width:${percAseo}%; background:${colAseo};"></div>
-                </div>
-            </div>
-
-            <div class="summary-block">
-                <div class="summary-header">
-                    <span class="summary-title" style="color:#8b5cf6;">🔧 Mantenimiento</span>
-                    <span class="summary-perc" style="color:${colMtto};">${percMtto}%</span>
-                </div>
-                <div class="summary-sub">De un total de <b>${totMtto}</b>, <b>${okMtto}</b> realizadas${textHHMtto}</div>
-                <div class="summary-bar-bg">
-                    <div class="summary-bar-fill" style="width:${percMtto}%; background:${colMtto};"></div>
-                </div>
-            </div>
-
-            <div class="summary-block" style="background:#eff6ff; border-color:#bfdbfe; text-align:center; padding: 20px 15px; margin-top: auto; margin-bottom: 0;">
-                <div style="font-size:0.8rem; color:#1e40af; font-weight:700; text-transform:uppercase; margin-bottom:5px;">Cumplimiento Plan FDS Total</div>
-                <div style="font-size:2rem; font-weight:800; color:${colGen};">${percGen}%</div>
-                <div style="font-size:0.85rem; color:#3b82f6; margin-top:5px;">De un total de <b>${totGen}</b> actividades${textHHGen}</div>
-            </div>
+        document.getElementById('summary_content').innerHTML = `
+            <div class="summary-block"><div class="summary-header"><span class="summary-title" style="color:#eab308;">🧹 Aseo / Sanitización y Seg.</span><span class="summary-perc" style="color:${colAseo};">${percAseo}%</span></div><div class="summary-sub">De un total de <b>${totAseo}</b>, <b>${okAseo}</b> realizadas</div><div class="summary-bar-bg"><div class="summary-bar-fill" style="width:${percAseo}%; background:${colAseo};"></div></div></div>
+            <div class="summary-block"><div class="summary-header"><span class="summary-title" style="color:#8b5cf6;">🔧 Mantenimiento</span><span class="summary-perc" style="color:${colMtto};">${percMtto}%</span></div><div class="summary-sub">De un total de <b>${totMtto}</b>, <b>${okMtto}</b> realizadas</div><div class="summary-bar-bg"><div class="summary-bar-fill" style="width:${percMtto}%; background:${colMtto};"></div></div></div>
+            <div class="summary-block" style="background:#eff6ff; border-color:#bfdbfe; text-align:center; padding: 20px 15px; margin-top: auto; margin-bottom: 0;"><div style="font-size:0.8rem; color:#1e40af; font-weight:700; text-transform:uppercase; margin-bottom:5px;">Cumplimiento Plan FDS Total</div><div style="font-size:2rem; font-weight:800; color:${colGen};">${percGen}%</div></div>
         `;
-        document.getElementById('summary_content').innerHTML = summaryHtml;
 
-        const chartOpts = { 
-            maintainAspectRatio:false, 
-            responsive:true, 
-            animation: { duration: 1200, easing: 'easeOutQuart' },
-            layout: { padding: 10 }
-        };
-        const gridHideY = { x: { grid: { color: '#f1f5f9' } }, y: { grid: { display: false } } };
-
-        new Chart(getFreshCanvas('chart1'), { 
-            type: 'doughnut', 
-            data: { 
-                labels:['Cerradas', 'En Proceso', 'Pendientes', 'Programadas'], 
-                datasets:[{ 
-                    data:[stats.ok, stats.proc, stats.pend, stats.prog], 
-                    backgroundColor:['#10b981', '#f59e0b', '#ef4444', '#3b82f6'], 
-                    borderWidth: 2, borderColor: '#fff', hoverOffset: 5 
-                }] 
-            }, 
-            options: { 
-                ...chartOpts, 
-                cutout: '65%', 
-                plugins: { 
-                    legend: { position: 'bottom', labels: { padding: 20, usePointStyle: true } }, 
-                    datalabels: { 
-                        display: (ctx) => { 
-                            let val = ctx.dataset.data[ctx.dataIndex]; 
-                            if(val === 0) return false; 
-                            let sum = ctx.chart.data.datasets[0].data.reduce((a, b) => a + b, 0); 
-                            return (val * 100 / sum) > 4;
-                        }, 
-                        color: '#fff', 
-                        font: { weight: 'bold', size: 14 }, 
-                        formatter: (value, ctx) => { 
-                            let sum = ctx.chart.data.datasets[0].data.reduce((a, b) => a + b, 0); 
-                            return (value * 100 / sum).toFixed(0) + '%'; 
-                        } 
-                    } 
-                }, 
-                onClick: (e, els, ch) => { 
-                    if(els.length>0) showDataModal(ch.data.labels[els[0].index], d => { 
-                        let st = ch.data.labels[els[0].index]; 
-                        if(st==='Cerradas') return d.status==='realizada'; 
-                        if(st==='En Proceso') return d.status==='en proceso'; 
-                        if(st==='Programadas') return d.status==='programado'; 
-                        return d.status==='pendiente'; 
-                    }); 
-                } 
-            }
-        });
-        
+        const chartOpts = { maintainAspectRatio:false, responsive:true, animation: { duration: 1200, easing: 'easeOutQuart' }, layout: { padding: 10 } };
+        new Chart(getFreshCanvas('chart1'), { type: 'doughnut', data: { labels:['Cerradas', 'En Proceso', 'Pendientes', 'Programadas'], datasets:[{ data:[stats.ok, stats.proc, stats.pend, stats.prog], backgroundColor:['#10b981', '#f59e0b', '#ef4444', '#3b82f6'], borderWidth: 2, borderColor: '#fff' }] }, options: { ...chartOpts, cutout: '65%', plugins: { legend: { position: 'bottom', labels: { padding: 20, usePointStyle: true } } } } });
         let cLabels = Object.keys(stats.cCounts);
         let baseColors = ['#3b82f6','#8b5cf6','#ec4899','#14b8a6','#f97316', '#6366f1', '#10b981'];
-        let cBgColors = cLabels.map((lbl, idx) => {
-            let l = lbl.toLowerCase();
-            if(l.includes('aseo') || l.includes('limpieza') || l.includes('sanitizacion y seguridad') || l.includes('sanitización y seguridad')) return '#eab308';
-            return baseColors[idx % baseColors.length];
-        });
+        let cBgColors = cLabels.map((lbl, idx) => { let l = lbl.toLowerCase(); if(l.includes('aseo') || l.includes('sanit')) return '#eab308'; return baseColors[idx % baseColors.length]; });
+        new Chart(getFreshCanvas('chart2'), { type: 'pie', data: { labels: cLabels, datasets:[{ data:Object.values(stats.cCounts), backgroundColor: cBgColors, borderWidth: 2, borderColor: '#fff' }] }, options: { ...chartOpts, plugins: { legend: { position: 'right', labels: { padding: 15, usePointStyle: true } } } } });
 
-        new Chart(getFreshCanvas('chart2'), { 
-            type: 'pie', 
-            data: { labels: cLabels, datasets:[{ data:Object.values(stats.cCounts), backgroundColor: cBgColors, borderWidth: 2, borderColor: '#fff', hoverOffset: 5 }] }, 
-            options: { 
-                ...chartOpts, 
-                plugins: { 
-                    legend: { position: 'right', labels: { padding: 15, usePointStyle: true } }, 
-                    datalabels: { 
-                        display: (ctx) => { 
-                            let val = ctx.dataset.data[ctx.dataIndex]; 
-                            if(val === 0) return false; 
-                            let sum = ctx.chart.data.datasets[0].data.reduce((a, b) => a + b, 0); 
-                            return (val * 100 / sum) > 4;
-                        }, 
-                        color: '#fff', 
-                        font: { weight: 'bold', size: 14 }, 
-                        formatter: (value, ctx) => { 
-                            let sum = ctx.chart.data.datasets[0].data.reduce((a, b) => a + b, 0); 
-                            return (value * 100 / sum).toFixed(0) + '%'; 
-                        } 
-                    } 
-                }, 
-                onClick: (e, els, ch) => { if(els.length>0) showDataModal(ch.data.labels[els[0].index], d => d.clase === ch.data.labels[els[0].index]); } 
-            }
-        });
-        
-        let statsAreaHH = {
-            'Mecánico': { ok: 0, proc: 0, pend: 0, sin_hh: 0 },
-            'Autómata': { ok: 0, proc: 0, pend: 0, sin_hh: 0 },
-            'Frio': { ok: 0, proc: 0, pend: 0, sin_hh: 0 },
-            'Infraestructura': { ok: 0, proc: 0, pend: 0, sin_hh: 0 }
-        };
-        
-        data.forEach(d => {
-            let a = getAreaResp(d.ejecutor);
-            if (statsAreaHH[a]) {
-                let hh = parseFloat(d.hh) || 0;
-                if (hh > 0) {
-                    if (d.status === 'realizada') statsAreaHH[a].ok += hh;
-                    else if (d.status === 'en proceso') statsAreaHH[a].proc += hh;
-                    else statsAreaHH[a].pend += hh; 
-                } else {
-                    statsAreaHH[a].sin_hh += 1; 
-                }
-            }
-        });
-
-        let labelsAreaHH = Object.keys(statsAreaHH).sort((a, b) => {
-            let totA = statsAreaHH[a].ok + statsAreaHH[a].proc + statsAreaHH[a].pend;
-            let totB = statsAreaHH[b].ok + statsAreaHH[b].proc + statsAreaHH[b].pend;
-            return totB - totA;
-        });
-
-        new Chart(getFreshCanvas('chart_hh_area'), {
-            type: 'bar',
-            data: {
-                labels: labelsAreaHH,
-                datasets: [
-                    { label: 'Pendientes (HH)', data: labelsAreaHH.map(l => statsAreaHH[l].pend), backgroundColor: '#ef4444', borderRadius: 4, barPercentage: 0.7 },
-                    { label: 'En Proceso (HH)', data: labelsAreaHH.map(l => statsAreaHH[l].proc), backgroundColor: '#f59e0b', borderRadius: 4, barPercentage: 0.7 },
-                    { label: 'Cerradas (HH)', data: labelsAreaHH.map(l => statsAreaHH[l].ok), backgroundColor: '#10b981', borderRadius: 4, barPercentage: 0.7 },
-                    { label: 'Sin Tiempo (Cant. OTs)', data: labelsAreaHH.map(l => statsAreaHH[l].sin_hh), backgroundColor: '#94a3b8', borderRadius: 4, barPercentage: 0.7 } 
-                ]
-            },
-            options: {
-                ...chartOpts,
-                indexAxis: 'y',
-                scales: {
-                    x: { stacked: true, grid: { color: '#f1f5f9' } },
-                    y: { stacked: true, grid: { display: false } }
-                },
-                plugins: {
-                    legend: { position: 'top', labels: { usePointStyle: true } },
-                    datalabels: {
-                        display: (ctx) => ctx.dataset.data[ctx.dataIndex] > 0,
-                        color: '#fff',
-                        font: { weight: 'bold', size: 12 },
-                        formatter: (value, ctx) => {
-                            if (ctx.datasetIndex === 3) return value + ' OTs'; 
-                            return (value % 1 === 0 ? value : value.toFixed(1)) + 'h'; 
-                        }
-                    }
-                },
-                onClick: (e, els, ch) => {
-                    if (els.length > 0) {
-                        let label = ch.data.labels[els[0].index];
-                        let dsIdx = els[0].datasetIndex;
-                        let tituloModal = dsIdx === 3 ? 'Sin Tiempos' : (dsIdx === 2 ? 'Cerradas' : (dsIdx === 1 ? 'En Proceso' : 'Pendientes'));
-                        
-                        showDataModal('Área: ' + label + ' - ' + tituloModal, d => {
-                            let isMatch = getAreaResp(d.ejecutor) === label;
-                            if (!isMatch) return false;
-
-                            let hh = parseFloat(d.hh) || 0;
-                            if (dsIdx === 3) return hh === 0; 
-                            if (dsIdx === 2) return d.status === 'realizada' && hh > 0;
-                            if (dsIdx === 1) return d.status === 'en proceso' && hh > 0;
-                            return d.status !== 'realizada' && d.status !== 'en proceso' && hh > 0;
-                        });
-                    }
-                }
-            }
-        });
+        let statsAreaHH = { 'Mecánico': { ok: 0, proc: 0, pend: 0, sin_hh: 0 }, 'Autómata': { ok: 0, proc: 0, pend: 0, sin_hh: 0 }, 'Frio': { ok: 0, proc: 0, pend: 0, sin_hh: 0 }, 'Infraestructura': { ok: 0, proc: 0, pend: 0, sin_hh: 0 } };
+        data.forEach(d => { let a = getAreaResp(d.ejecutor); if (statsAreaHH[a]) { let hh = parseFloat(d.hh) || 0; if (hh > 0) { if (d.status === 'realizada') statsAreaHH[a].ok += hh; else if (d.status === 'en proceso') statsAreaHH[a].proc += hh; else statsAreaHH[a].pend += hh; } else { statsAreaHH[a].sin_hh += 1; } } });
+        let labelsAreaHH = Object.keys(statsAreaHH).sort((a, b) => (statsAreaHH[b].ok + statsAreaHH[b].proc + statsAreaHH[b].pend) - (statsAreaHH[a].ok + statsAreaHH[a].proc + statsAreaHH[a].pend));
+        new Chart(getFreshCanvas('chart_hh_area'), { type: 'bar', data: { labels: labelsAreaHH, datasets: [ { label: 'Pendientes (HH)', data: labelsAreaHH.map(l => statsAreaHH[l].pend), backgroundColor: '#ef4444' }, { label: 'En Proceso (HH)', data: labelsAreaHH.map(l => statsAreaHH[l].proc), backgroundColor: '#f59e0b' }, { label: 'Cerradas (HH)', data: labelsAreaHH.map(l => statsAreaHH[l].ok), backgroundColor: '#10b981' } ] }, options: { ...chartOpts, indexAxis: 'y', scales: { x: { stacked: true }, y: { stacked: true } } } });
 
         const areaLabels = ['Mecánico', 'Autómata', 'Frio', 'Infraestructura'];
-        const areaPendData = areaLabels.map(l => statsArea[l].pend);
-        const areaProcData = areaLabels.map(l => statsArea[l].proc);
-        const areaOkData = areaLabels.map(l => statsArea[l].ok);
-
-        new Chart(getFreshCanvas('chart5'), {
-            type: 'bar',
-            data: { 
-                labels: areaLabels, 
-                datasets: [ 
-                    { label: 'Pendientes', data: areaPendData, backgroundColor: '#ef4444', borderRadius: 4, barPercentage: 0.7 },
-                    { label: 'En Proceso', data: areaProcData, backgroundColor: '#f59e0b', borderRadius: 4, barPercentage: 0.7 },
-                    { label: 'Cerradas', data: areaOkData, backgroundColor: '#10b981', borderRadius: 4, barPercentage: 0.7 }
-                ] 
-            },
-            options: { 
-                ...chartOpts, 
-                indexAxis: 'y', 
-                scales: { 
-                    x: { stacked: true, grid: { color: '#f1f5f9' }, ticks: { stepSize: 5 } }, 
-                    y: { stacked: true, grid: { display: false } } 
-                }, 
-                plugins: { 
-                    legend: { position: 'top', labels: { usePointStyle: true } }, 
-                    datalabels: { 
-                        display: (ctx) => {
-                            let val = ctx.dataset.data[ctx.dataIndex];
-                            return val > 0; 
-                        }, 
-                        color: '#fff', 
-                        font: { weight: 'bold', size: 12 }, 
-                        formatter: (value, ctx) => { 
-                            let sum = 0; 
-                            ctx.chart.data.datasets.forEach(ds => { sum += ds.data[ctx.dataIndex]; }); 
-                            return sum > 0 ? (value * 100 / sum).toFixed(0) + '%' : '0%'; 
-                        } 
-                    } 
-                }, 
-                onClick: (e, els, ch) => { 
-                    if(els.length > 0) {
-                        let label = ch.data.labels[els[0].index];
-                        let datasetIndex = els[0].datasetIndex;
-                        let targetStatus = datasetIndex === 2 ? 'realizada' : (datasetIndex === 1 ? 'en proceso' : 'pendiente');
-                        let titleStatus = datasetIndex === 2 ? 'Cerradas' : (datasetIndex === 1 ? 'En Proceso' : 'Pendientes');
-
-                        showDataModal('Avance ' + label + ' - ' + titleStatus, d => {
-                            let isStMatch = false;
-                            if (targetStatus === 'realizada') isStMatch = (d.status === 'realizada');
-                            else if (targetStatus === 'en proceso') isStMatch = (d.status === 'en proceso');
-                            else isStMatch = (d.status !== 'realizada' && d.status !== 'en proceso');
-                            
-                            if (!isStMatch) return false;
-                            return getAreaResp(d.ejecutor) === label;
-                        });
-                    }
-                } 
-            }
-        });
+        new Chart(getFreshCanvas('chart5'), { type: 'bar', data: { labels: areaLabels, datasets: [ { label: 'Pendientes', data: areaLabels.map(l => statsArea[l].pend), backgroundColor: '#ef4444' }, { label: 'En Proceso', data: areaLabels.map(l => statsArea[l].proc), backgroundColor: '#f59e0b' }, { label: 'Cerradas', data: areaLabels.map(l => statsArea[l].ok), backgroundColor: '#10b981' } ] }, options: { ...chartOpts, indexAxis: 'y', scales: { x: { stacked: true }, y: { stacked: true } } } });
         
         const sortedEx = Object.entries(stats.ex).sort((a,b)=>(b[1].ok+b[1].pend+b[1].proc)-(a[1].ok+a[1].pend+a[1].proc)).slice(0,12);
-        new Chart(getFreshCanvas('chart3'), { 
-            type: 'bar', 
-            data: { 
-                labels: sortedEx.map(x=>x[0]), 
-                datasets: [ 
-                    { label:'Pendientes', data:sortedEx.map(x=>x[1].pend), backgroundColor:'#ef4444', borderRadius: 4, barPercentage: 0.7 }, 
-                    { label:'En Proceso', data:sortedEx.map(x=>x[1].proc), backgroundColor:'#f59e0b', borderRadius: 4, barPercentage: 0.7 }, 
-                    { label:'Cerradas', data:sortedEx.map(x=>x[1].ok), backgroundColor:'#10b981', borderRadius: 4, barPercentage: 0.7 } 
-                ]
-            }, 
-            options: { 
-                ...chartOpts, 
-                indexAxis: 'y', 
-                scales: { 
-                    x: { stacked: true, grid: { color: '#f1f5f9' }, ticks: { stepSize: 5 } }, 
-                    y: { stacked: true, grid: { display: false } } 
-                }, 
-                plugins: { 
-                    legend: { position: 'top', labels: { usePointStyle: true } }, 
-                    datalabels: { 
-                        display: (ctx) => {
-                            let val = ctx.dataset.data[ctx.dataIndex];
-                            return val > 0;
-                        }, 
-                        color: '#fff', 
-                        font: { weight: 'bold', size: 12 }, 
-                        formatter: (value, ctx) => { 
-                            let sum = 0; 
-                            ctx.chart.data.datasets.forEach(ds => { sum += ds.data[ctx.dataIndex]; }); 
-                            return sum > 0 ? (value * 100 / sum).toFixed(0) + '%' : '0%'; 
-                        } 
-                    } 
-                }, 
-                onClick: (e, els, ch) => { 
-                    if(els.length>0) {
-                        let label = ch.data.labels[els[0].index];
-                        let datasetIndex = els[0].datasetIndex;
-                        let targetStatus = datasetIndex === 2 ? 'realizada' : (datasetIndex === 1 ? 'en proceso' : 'pendiente');
-                        
-                        showDataModal(label, d => {
-                            let isMatch = d.ejecutor === label;
-                            if(targetStatus === 'realizada') return isMatch && d.status === 'realizada';
-                            if(targetStatus === 'en proceso') return isMatch && d.status === 'en proceso';
-                            return isMatch && d.status !== 'realizada' && d.status !== 'en proceso';
-                        }); 
-                    }
-                } 
-            }
-        });
+        new Chart(getFreshCanvas('chart3'), { type: 'bar', data: { labels: sortedEx.map(x=>x[0]), datasets: [ { label:'Pendientes', data:sortedEx.map(x=>x[1].pend), backgroundColor:'#ef4444'}, { label:'En Proceso', data:sortedEx.map(x=>x[1].proc), backgroundColor:'#f59e0b'}, { label:'Cerradas', data:sortedEx.map(x=>x[1].ok), backgroundColor:'#10b981'} ] }, options: { ...chartOpts, indexAxis: 'y', scales: { x: { stacked: true }, y: { stacked: true } } } });
 
         const sortedLocs = Object.entries(stats.loc).sort((a,b)=>b[1]-a[1]).slice(0,12);
-        new Chart(getFreshCanvas('chart4'), {
-            type: 'bar',
-            data: { labels: sortedLocs.map(x=>x[0]), datasets: [ { label: 'Total Hallazgos', data: sortedLocs.map(x=>x[1]), backgroundColor:'#8b5cf6', borderRadius: 6, barPercentage: 0.6 } ]},
-            options: { 
-                ...chartOpts, 
-                indexAxis: 'y', 
-                scales: gridHideY, 
-                plugins: { 
-                    legend: { display: false }, 
-                    datalabels: {display:false} 
-                }, 
-                onClick: (e, els, ch) => { if(els.length>0) showDataModal(ch.data.labels[els[0].index], d => d.ubicacion === ch.data.labels[els[0].index], 'clase'); } 
-            }
-        });
+        new Chart(getFreshCanvas('chart4'), { type: 'bar', data: { labels: sortedLocs.map(x=>x[0]), datasets: [ { label: 'Total Hallazgos', data: sortedLocs.map(x=>x[1]), backgroundColor:'#8b5cf6' } ]}, options: { ...chartOpts, indexAxis: 'y' } });
     }
 
     function drawRowCharts(data) {
         if(!data) return;
-
-        const semVal = document.getElementById('f_semana') ? document.getElementById('f_semana').value : 'ALL';
-        document.getElementById('row_week_title').innerText = semVal === "ALL" ? "Semanas: " + weeks.join(' y ') : "Semana " + semVal;
-        
-        let stats = {
-            mtto: { total: 0, ok: 0 },
-            aseo: { total: 0, ok: 0 },
-            panaderia: {
-                'L1': { mtto: {tot:0, ok:0} },
-                'L2': { mtto: {tot:0, ok:0} },
-                'L3': { mtto: {tot:0, ok:0} },
-                'L4': { mtto: {tot:0, ok:0} },
-                'L5': { mtto: {tot:0, ok:0} }
-            },
-            dely: {
-                'Pizza': { mtto: {tot:0, ok:0} },
-                'Bolleria': { mtto: {tot:0, ok:0} },
-                'Empanadas': { mtto: {tot:0, ok:0} }
-            }
-        };
-        
+        let stats = { mtto: { total: 0, ok: 0 }, aseo: { total: 0, ok: 0 }, panaderia: { 'L1': { mtto: {tot:0, ok:0} }, 'L2': { mtto: {tot:0, ok:0} }, 'L3': { mtto: {tot:0, ok:0} }, 'L4': { mtto: {tot:0, ok:0} }, 'L5': { mtto: {tot:0, ok:0} } }, dely: { 'Pizza': { mtto: {tot:0, ok:0} }, 'Bolleria': { mtto: {tot:0, ok:0} }, 'Empanadas': { mtto: {tot:0, ok:0} } } };
         data.forEach(d => {
-            let isOk = (d.status === 'realizada');
-            let isAseo = isAseoAct(d);
-            let isMtto = !isAseo; 
-            
-            if (isAseo) { stats.aseo.total++; if(isOk) stats.aseo.ok++; }
-            if (isMtto) { stats.mtto.total++; if(isOk) stats.mtto.ok++; }
-            
-            let pLoc = getPLoc(d);
-            if (pLoc && isMtto) { stats.panaderia[pLoc].mtto.tot++; if(isOk) stats.panaderia[pLoc].mtto.ok++; }
-            
-            let dLoc = getDLoc(d);
-            if (dLoc && isMtto) { stats.dely[dLoc].mtto.tot++; if(isOk) stats.dely[dLoc].mtto.ok++; }
+            let isOk = (d.status === 'realizada'); let isAseo = isAseoAct(d); let isMtto = !isAseo; 
+            if (isAseo) { stats.aseo.total++; if(isOk) stats.aseo.ok++; } if (isMtto) { stats.mtto.total++; if(isOk) stats.mtto.ok++; }
+            let pLoc = getPLoc(d); if (pLoc && isMtto) { stats.panaderia[pLoc].mtto.tot++; if(isOk) stats.panaderia[pLoc].mtto.ok++; }
+            let dLoc = getDLoc(d); if (dLoc && isMtto) { stats.dely[dLoc].mtto.tot++; if(isOk) stats.dely[dLoc].mtto.ok++; }
         });
-
         const getPerc = (ok, tot) => tot > 0 ? Math.round((ok/tot)*100) : 0;
-        
-        const chartIds = ['row_chart1', 'row_chart2', 'row_chart3', 'row_chart4', 'row_chart5'];
-        chartIds.forEach(id => {
-            if (chartInstances[id]) { chartInstances[id].destroy(); chartInstances[id] = null; }
-        });
-
-        const commonOptsRow = { 
-            maintainAspectRatio: false, responsive: true, animation: { duration: 1000 },
-            plugins: { 
-                legend: { position: 'top', labels: { usePointStyle: true } },
-                datalabels: { 
-                    display: (ctx) => ctx.dataset.data[ctx.dataIndex] > 0, 
-                    color: '#fff', font: { weight: 'bold', size: 13 },
-                    formatter: (val) => val + '%'
-                }
-            }
-        };
-
+        const cOpts = { maintainAspectRatio: false, responsive: true, plugins: { legend: { position: 'top' } } };
         let totalAct = stats.mtto.total + stats.aseo.total;
-        let pMttoTot = getPerc(stats.mtto.total, totalAct);
-        let pAseoTot = getPerc(stats.aseo.total, totalAct);
-        
-        chartInstances['row_chart1'] = new Chart(getFreshCanvas('row_chart1'), {
-            type: 'pie',
-            data: { labels: ['Mantenimiento', 'Aseo / Sanit. y Seg.'], datasets: [{ data: [pMttoTot, pAseoTot], backgroundColor: ['#3b82f6', '#eab308'], borderWidth: 2, borderColor: '#fff' }] },
-            options: { 
-                ...commonOptsRow, 
-                plugins: { ...commonOptsRow.plugins, legend: { position: 'bottom', labels: { usePointStyle: true } } },
-                onClick: (e, els, ch) => { 
-                    if(els.length>0) {
-                        let label = ch.data.labels[els[0].index];
-                        showDataModal(label, d => label === 'Aseo / Sanit. y Seg.' ? isAseoAct(d) : !isAseoAct(d));
-                    }
-                }
-            }
-        });
-
-        let pMttoCump = getPerc(stats.mtto.ok, stats.mtto.total);
-        chartInstances['row_chart2'] = new Chart(getFreshCanvas('row_chart2'), {
-            type: 'bar',
-            data: { labels: ['Cumplimiento MTTO'], datasets: [{ label: 'Cerradas', data: [pMttoCump], backgroundColor: '#3b82f6', barPercentage: 0.5, borderRadius: 6 }] },
-            options: { 
-                ...commonOptsRow, indexAxis: 'y', scales: { x: { max: 100, grid: {color:'#f1f5f9'} }, y: { grid: {display:false} } }, 
-                plugins: { ...commonOptsRow.plugins, legend: { display: false } },
-                onClick: (e, els, ch) => { if(els.length>0) showDataModal('Mantenimiento (General)', d => !isAseoAct(d)); }
-            }
-        });
-
-        let pAseoCump = getPerc(stats.aseo.ok, stats.aseo.total);
-        chartInstances['row_chart3'] = new Chart(getFreshCanvas('row_chart3'), {
-            type: 'bar',
-            data: { labels: ['Cumpl. Aseo / Sanit. y Seg.'], datasets: [{ label: 'Cerradas', data: [pAseoCump], backgroundColor: '#eab308', barPercentage: 0.5, borderRadius: 6 }] },
-            options: { 
-                ...commonOptsRow, indexAxis: 'y', scales: { x: { max: 100, grid: {color:'#f1f5f9'} }, y: { grid: {display:false} } }, 
-                plugins: { ...commonOptsRow.plugins, legend: { display: false } },
-                onClick: (e, els, ch) => { if(els.length>0) showDataModal('Aseo / Sanitización y Seguridad', d => isAseoAct(d)); }
-            }
-        });
-
-        const pLabels = ['L1', 'L2', 'L3', 'L4', 'L5'];
-        const pMttoData = pLabels.map(l => getPerc(stats.panaderia[l].mtto.ok, stats.panaderia[l].mtto.tot));
-        
-        chartInstances['row_chart4'] = new Chart(getFreshCanvas('row_chart4'), {
-            type: 'bar',
-            data: { 
-                labels: pLabels, 
-                datasets: [ { label: '% Cumpl. Mtto', data: pMttoData, backgroundColor: '#3b82f6', borderRadius: 4, barPercentage: 0.8, categoryPercentage: 0.8 } ] 
-            },
-            options: { 
-                ...commonOptsRow, indexAxis: 'y', scales: { x: { max: 100, grid: {color:'#f1f5f9'} }, y: { grid: {display:false} } }, 
-                plugins: { ...commonOptsRow.plugins, legend: { display: false } },
-                onClick: (e, els, ch) => { 
-                    if(els.length>0) {
-                        let label = ch.data.labels[els[0].index];
-                        showDataModal('Panadería MTTO - ' + label, d => !isAseoAct(d) && getPLoc(d) === label);
-                    }
-                }
-            }
-        });
-
-        const dLabels = ['Pizza', 'Bolleria', 'Empanadas'];
-        const dMttoData = dLabels.map(l => getPerc(stats.dely[l].mtto.ok, stats.dely[l].mtto.tot));
-        
-        chartInstances['row_chart5'] = new Chart(getFreshCanvas('row_chart5'), {
-            type: 'bar',
-            data: { 
-                labels: dLabels, 
-                datasets: [ { label: '% Cumpl. Mtto', data: dMttoData, backgroundColor: '#3b82f6', borderRadius: 4, barPercentage: 0.8, categoryPercentage: 0.8 } ] 
-            },
-            options: { 
-                ...commonOptsRow, indexAxis: 'y', scales: { x: { max: 100, grid: {color:'#f1f5f9'} }, y: { grid: {display:false} } }, 
-                plugins: { ...commonOptsRow.plugins, legend: { display: false } },
-                onClick: (e, els, ch) => { 
-                    if(els.length>0) {
-                        let label = ch.data.labels[els[0].index];
-                        showDataModal('Dely MTTO - ' + label, d => !isAseoAct(d) && getDLoc(d) === label);
-                    }
-                }
-            }
-        });
+        new Chart(getFreshCanvas('row_chart1'), { type: 'pie', data: { labels: ['Mantenimiento', 'Aseo'], datasets: [{ data: [getPerc(stats.mtto.total, totalAct), getPerc(stats.aseo.total, totalAct)], backgroundColor: ['#3b82f6', '#eab308'] }] }, options: cOpts });
+        new Chart(getFreshCanvas('row_chart2'), { type: 'bar', data: { labels: ['Cumplimiento MTTO'], datasets: [{ label: 'Cerradas', data: [getPerc(stats.mtto.ok, stats.mtto.total)], backgroundColor: '#3b82f6' }] }, options: { ...cOpts, indexAxis: 'y', scales: { x: { max: 100 } } } });
+        new Chart(getFreshCanvas('row_chart3'), { type: 'bar', data: { labels: ['Cumpl. Aseo'], datasets: [{ label: 'Cerradas', data: [getPerc(stats.aseo.ok, stats.aseo.total)], backgroundColor: '#eab308' }] }, options: { ...cOpts, indexAxis: 'y', scales: { x: { max: 100 } } } });
+        const pLabels = ['L1', 'L2', 'L3', 'L4', 'L5']; new Chart(getFreshCanvas('row_chart4'), { type: 'bar', data: { labels: pLabels, datasets: [ { label: '% Cumpl. Mtto', data: pLabels.map(l => getPerc(stats.panaderia[l].mtto.ok, stats.panaderia[l].mtto.tot)), backgroundColor: '#3b82f6' } ] }, options: { ...cOpts, indexAxis: 'y', scales: { x: { max: 100 } } } });
+        const dLabels = ['Pizza', 'Bolleria', 'Empanadas']; new Chart(getFreshCanvas('row_chart5'), { type: 'bar', data: { labels: dLabels, datasets: [ { label: '% Cumpl. Mtto', data: dLabels.map(l => getPerc(stats.dely[l].mtto.ok, stats.dely[l].mtto.tot)), backgroundColor: '#3b82f6' } ] }, options: { ...cOpts, indexAxis: 'y', scales: { x: { max: 100 } } } });
     }
 
-    // ==========================================
-    // NUEVA FUNCIÓN PARA CONSTRUIR EL GANTT DE TURNOS
-    // ==========================================
     function drawGantt(data) {
         const container = document.getElementById('gantt_container');
         container.innerHTML = '';
-        
-        if (!data || data.length === 0) {
-            container.innerHTML = `<div class="empty-state" style="width:100%;"><h3>No hay datos para graficar turnos</h3><p>Intenta cambiar los filtros superiores.</p></div>`;
-            return;
-        }
-
+        if (!data || data.length === 0) return;
         const diasOrden = ['Jueves', 'Viernes', 'Sabado', 'Domingo', 'Lunes', 'Martes', 'Miercoles'];
-        
         let schedule = {};
-        diasOrden.forEach(d => {
-            schedule[d] = {
-                totalHH: 0,
-                turnos: { 
-                    'Mañana': { hh: 0, act: [] }, 
-                    'Tarde': { hh: 0, act: [] }, 
-                    'Noche': { hh: 0, act: [] }, 
-                    'Cuarto Turno': { hh: 0, act: [] },
-                    'Sin Turno Asignado': { hh: 0, act: [] } 
-                }
-            };
-        });
-
-        const getShift = (t1, t2, t3) => {
-            let combo = (String(t1) + " " + String(t2) + " " + String(t3)).toUpperCase();
-            
-            // Forzamos a Mañana a los Lubricadores y Externos (LM1 y EM1-8), además de los AM/MM normales de mañana
-            if (/(AM[1-3]|MM[1-3]|LM1|EM[1-8])/.test(combo)) return 'Mañana';
-            if (/(AT[1-3]|MT[1-3])/.test(combo)) return 'Tarde';
-            if (/(AN[1-3]|MN[1-3])/.test(combo)) return 'Noche';
-            if (/(M4[1-3])/.test(combo)) return 'Cuarto Turno';
-            
-            // Fallbacks de seguridad
-            if (combo.includes('MM') || combo.includes('AM') || combo.includes('LM') || combo.includes('EM')) return 'Mañana';
-            if (combo.includes('MT') || combo.includes('AT')) return 'Tarde';
-            if (combo.includes('MN') || combo.includes('AN')) return 'Noche';
-            
-            return 'Sin Turno Asignado';
-        };
-
-        const normalizarDia = (d) => {
-            if(!d || d === 'ALL') return 'Sin Día Asignado';
-            let lower = String(d).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); 
-            if(lower.includes('lun')) return 'Lunes';
-            if(lower.includes('mar')) return 'Martes';
-            if(lower.includes('mier')) return 'Miercoles';
-            if(lower.includes('jue')) return 'Jueves';
-            if(lower.includes('vie')) return 'Viernes';
-            if(lower.includes('sab')) return 'Sabado';
-            if(lower.includes('dom')) return 'Domingo';
-            return 'Sin Día Asignado';
-        };
-
+        diasOrden.forEach(d => { schedule[d] = { totalHH: 0, turnos: { 'Mañana': { hh: 0, act: [] }, 'Tarde': { hh: 0, act: [] }, 'Noche': { hh: 0, act: [] }, 'Cuarto Turno': { hh: 0, act: [] }, 'Sin Turno Asignado': { hh: 0, act: [] } } }; });
+        const getShift = (t1, t2, t3) => { let c = (String(t1) + " " + String(t2) + " " + String(t3)).toUpperCase(); if (/(AM|MM|LM|EM)/.test(c)) return 'Mañana'; if (/(AT|MT)/.test(c)) return 'Tarde'; if (/(AN|MN)/.test(c)) return 'Noche'; if (/(M4)/.test(c)) return 'Cuarto Turno'; return 'Sin Turno Asignado'; };
+        const normDia = (d) => { if(!d || d === 'ALL') return 'Sin Día Asignado'; let l = String(d).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); if(l.includes('lun')) return 'Lunes'; if(l.includes('mar')) return 'Martes'; if(l.includes('mier')) return 'Miercoles'; if(l.includes('jue')) return 'Jueves'; if(l.includes('vie')) return 'Viernes'; if(l.includes('sab')) return 'Sabado'; if(l.includes('dom')) return 'Domingo'; return 'Sin Día Asignado'; };
+        
         data.forEach(item => {
-            let d = normalizarDia(item.dia);
-            
-            if (!schedule[d]) {
-                schedule[d] = { 
-                    totalHH: 0, 
-                    turnos: { 'Mañana': { hh: 0, act: [] }, 'Tarde': { hh: 0, act: [] }, 'Noche': { hh: 0, act: [] }, 'Cuarto Turno': { hh: 0, act: [] }, 'Sin Turno Asignado': { hh: 0, act: [] } } 
-                };
-                if (!diasOrden.includes(d)) diasOrden.push(d);
-            }
-            
+            let d = normDia(item.dia);
+            if (!schedule[d]) { schedule[d] = { totalHH: 0, turnos: { 'Mañana': { hh: 0, act: [] }, 'Tarde': { hh: 0, act: [] }, 'Noche': { hh: 0, act: [] }, 'Cuarto Turno': { hh: 0, act: [] }, 'Sin Turno Asignado': { hh: 0, act: [] } } }; if (!diasOrden.includes(d)) diasOrden.push(d); }
             let shift = getShift(item.tecnico, item.tecnico1, item.tecnico2);
             let hh = parseFloat(item.hh) || 0;
-            
-            schedule[d].totalHH += hh;
-            schedule[d].turnos[shift].hh += hh;
-            schedule[d].turnos[shift].act.push(item);
+            schedule[d].totalHH += hh; schedule[d].turnos[shift].hh += hh; schedule[d].turnos[shift].act.push(item);
         });
 
         let htmlFinal = "";
         diasOrden.forEach(dia => {
-            let dayData = schedule[dia];
-            if(!dayData) return;
-            
-            let turnosArr = Object.values(dayData.turnos);
-            let isEmpty = turnosArr.every(t => t.act.length === 0);
-            
-            if (isEmpty && (dia === 'Sabado' || dia === 'Domingo' || dia === 'Sin Día Asignado')) return; 
-
-            htmlFinal += `<div class="gantt-day-col">
-                <div class="gantt-day-header">
-                    <h3 class="gantt-day-title">${dia}</h3>
-                    <span class="gantt-day-hh">Total Carga: ${dayData.totalHH.toFixed(1)} HH</span>
-                </div>
-                <div style="padding:15px; display:flex; flex-direction:column; overflow-y:auto; flex:1; background:#f8fafc;">`;
-
+            let dayData = schedule[dia]; if(!dayData) return;
+            if (Object.values(dayData.turnos).every(t => t.act.length === 0) && (dia === 'Sabado' || dia === 'Domingo' || dia === 'Sin Día Asignado')) return; 
+            htmlFinal += `<div class="gantt-day-col"><div class="gantt-day-header"><h3 class="gantt-day-title">${dia}</h3><span class="gantt-day-hh">Total Carga: ${dayData.totalHH.toFixed(1)} HH</span></div><div style="padding:15px; display:flex; flex-direction:column; overflow-y:auto; flex:1; background:#f8fafc;">`;
             ['Mañana', 'Tarde', 'Noche', 'Cuarto Turno', 'Sin Turno Asignado'].forEach(turno => {
                 let tData = dayData.turnos[turno];
                 if (tData.act.length > 0) {
-                    let tColor = '#94a3b8'; // Defecto gris
-                    if (turno === 'Mañana') tColor = '#3b82f6'; // Azul
-                    else if (turno === 'Tarde') tColor = '#f59e0b'; // Naranja
-                    else if (turno === 'Noche') tColor = '#8b5cf6'; // Morado
-                    else if (turno === 'Cuarto Turno') tColor = '#ec4899'; // Rosado
-                    
-                    htmlFinal += `
-                    <div class="gantt-shift-box" style="border:1px solid ${tColor}40; background:${tColor}10;">
-                        <div class="gantt-shift-header" style="color:${tColor}; border-bottom:1px solid ${tColor}40;">
-                            <span>${turno}</span>
-                            <span>${tData.hh.toFixed(1)} HH</span>
-                        </div>`;
-                    
+                    let tColor = turno === 'Mañana' ? '#3b82f6' : (turno === 'Tarde' ? '#f59e0b' : (turno === 'Noche' ? '#8b5cf6' : (turno === 'Cuarto Turno' ? '#ec4899' : '#94a3b8')));
+                    htmlFinal += `<div class="gantt-shift-box" style="border:1px solid ${tColor}40; background:${tColor}10;"><div class="gantt-shift-header" style="color:${tColor}; border-bottom:1px solid ${tColor}40;"><span>${turno}</span><span>${tData.hh.toFixed(1)} HH</span></div>`;
                     tData.act.forEach(a => {
                         let statusColor = a.status === 'realizada' ? '#10b981' : (a.status === 'en proceso' ? '#f59e0b' : '#ef4444');
-                        let actTitle = a.titulo.length > 40 ? a.titulo.substring(0,40) + '...' : a.titulo;
-                        
-                        let tecnicosIds = [a.tecnico, a.tecnico1, a.tecnico2].filter(x => x && x !== 'ALL').join(' | ');
-                        let nombreCorto = a.ejecutor ? a.ejecutor.split(' ')[0] : 'S/A';
-
-                        htmlFinal += `
-                        <div class="gantt-card" style="border-left-color:${statusColor};" onclick="document.getElementById('btn_tab_list').click(); setTimeout(() => renderDetail('${a.key_id}'), 100);">
-                            <div style="font-weight:700; color:var(--primary); margin-bottom:4px; display:flex; justify-content:space-between;">
-                                <span>${a.ot || a.tag || '#'+a.id_real}</span>
-                                <span style="font-size:0.7rem; color:${statusColor};">${a.status.toUpperCase()}</span>
-                            </div>
-                            <div style="color:var(--secondary); margin-bottom:6px; line-height:1.3;">${actTitle}</div>
-                            <div style="color:var(--muted); font-size:0.7rem; display:flex; justify-content:space-between; align-items:flex-end;">
-                                <div style="display:flex; flex-direction:column;">
-                                    <span style="font-weight:600;">👷 ${nombreCorto}</span>
-                                    <span style="font-size:0.65rem; opacity:0.8;">[${tecnicosIds || 'Sin Códigos'}]</span>
-                                </div>
-                                <span style="font-weight:700; color:var(--text); background:#e2e8f0; padding:2px 6px; border-radius:4px;">⏱️ ${parseFloat(a.hh||0).toFixed(1)} HH</span>
-                            </div>
-                        </div>`;
+                        htmlFinal += `<div class="gantt-card" style="border-left-color:${statusColor};" onclick="document.getElementById('btn_tab_list').click(); setTimeout(() => renderDetail('${a.key_id}'), 100);"><div style="font-weight:700; color:var(--primary); margin-bottom:4px; display:flex; justify-content:space-between;"><span>${a.ot || a.tag || '#'+a.id_real}</span><span style="font-size:0.7rem; color:${statusColor};">${a.status.toUpperCase()}</span></div><div style="color:var(--secondary); margin-bottom:6px; line-height:1.3;">${a.titulo}</div></div>`;
                     });
                     htmlFinal += `</div>`;
                 }
             });
-
             htmlFinal += `</div></div>`;
         });
-        
         container.innerHTML = htmlFinal;
     }
 
-    function drawGanttPM(data) {
-        const container = document.getElementById('gantt_pm_container');
-        if (!data || data.length === 0) {
-            container.innerHTML = `<div class="empty-state"><h3>No hay datos</h3><p>Ajusta los filtros (Ej. Línea/Área).</p></div>`;
-            return;
+    // ==========================================
+    // PLAN MATRIZ (Integración SP + SAP)
+    // ==========================================
+    window.setPmClass = function(c, btn) { 
+        currentPmClass = c; 
+        document.querySelectorAll('.tablinks-pm').forEach(b => b.classList.remove('active'));
+        if(btn) btn.classList.add('active');
+        drawGanttPM(); 
+    };
+    window.setPmYear = function(y) { currentPmYear = y; drawGanttPM(); };
+
+    window.showModalPM = function(encodedJson) {
+        let ots = JSON.parse(decodeURIComponent(encodedJson));
+        let html = `<div class="dm-header">
+            <h3>📊 Desglose de Actividades</h3>
+            <button class="dm-close" onclick="document.getElementById('data_modal').style.display='none'">&times;</button>
+        </div>
+        <div class="dm-body" style="padding:15px;"><table class="dm-table"><thead><tr>
+            <th>OT / ID</th><th>Equipo / Ubicación</th><th>Actividad</th><th>Fechas / Sem</th><th>Estado</th>
+        </tr></thead><tbody>`;
+
+        ots.forEach(o => {
+            let stColor = o.status === 'realizada' ? '#166534' : (o.status === 'pendiente' ? '#991b1b' : (o.status === 'en proceso' ? '#92400e' : '#075985'));
+            let clicAction = o.key_id ? `onclick="document.getElementById('data_modal').style.display='none'; document.getElementById('btn_tab_list').click(); setTimeout(() => renderDetail('${o.key_id}'), 100);"` : "";
+            
+            html += `<tr ${clicAction}>
+                <td style="font-weight:700;">${o.ot}</td>
+                <td>${o.equipo}<br><small style="color:var(--muted);">${o.ubicacion}</small></td>
+                <td>${o.actividad}</td>
+                <td>${o.fecha_prog}</td>
+                <td style="color:${stColor}; font-weight:700; text-transform:uppercase;">${o.status}</td>
+            </tr>`;
+        });
+        html += `</tbody></table></div>`;
+        document.getElementById('data_modal_content').innerHTML = html;
+        document.getElementById('data_modal').style.display = 'flex';
+    };
+
+    window.filtrarGanttPM = function() {
+        let input = document.getElementById("search_pm").value.toUpperCase();
+        let tr = document.querySelectorAll('#pm_table_render tbody tr');
+        
+        for (let i = 0; i < tr.length; i++) {
+            let td = tr[i].getElementsByTagName("td")[0];
+            if (td) {
+                let isMatch = (td.textContent || td.innerText).toUpperCase().indexOf(input) > -1;
+                tr[i].dataset.isMatch = isMatch;
+                tr[i].style.display = isMatch ? "" : "none";
+            }
         }
-
-        let tagDic = {};
-        data.forEach(d => {
-            if(d.tag && d.tag.trim() !== '') {
-                if(!tagDic[d.tag]) {
-                    tagDic[d.tag] = d.titulo || 'Sin Actividad';
-                }
-            }
-        });
-
-        let equiposUnicos = Object.keys(tagDic).sort();
-        const uVal = document.getElementById('f_ubi') ? document.getElementById('f_ubi').value : 'ALL';
-
-        let actPorEquipo = {};
-        equiposUnicos.forEach(tag => actPorEquipo[tag] = {});
-
-        data.forEach(d => {
-            if(d.tag && actPorEquipo[d.tag] && d.semana !== "S/N") {
-                let semNum = parseInt(d.semana);
-                if(!isNaN(semNum)) {
-                    actPorEquipo[d.tag][semNum] = { status: d.status, id: d.key_id };
-                }
-            }
-        });
-
-        let html = `<table class="pm-table"><thead><tr><th class="pm-tag-col">TAG - (TÍTULO ACTIVIDAD) [Línea: ${uVal}]</th>`;
-        for(let i = 1; i <= 52; i++) { html += `<th>S${i}</th>`; }
-        html += `</tr></thead><tbody>`;
-
-        equiposUnicos.forEach(tag => {
-            let etiquetaCompleta = `${tag} - (${tagDic[tag]})`;
-            let titleTag = etiquetaCompleta.length > 50 ? etiquetaCompleta.substring(0, 47) + '...' : etiquetaCompleta;
-
-            html += `<tr><td class="pm-tag-col" title="${etiquetaCompleta}">${titleTag}</td>`;
-
-            let frecData = baseFrecuencias[tag] || { frecuencia: 0, ultima_semana: 0 };
-
-            for(let sem = 1; sem <= 52; sem++) {
-                let cellHtml = ``;
-                let isPlanned = false;
-
-                if (frecData.frecuencia > 0) {
-                    if ((sem - frecData.ultima_semana) % frecData.frecuencia === 0 && sem >= frecData.ultima_semana) {
-                        isPlanned = true;
+        
+        if(input !== "") {
+            let currentLocIndex = -1;
+            let showChildrenOfLoc = false;
+            
+            for (let i = 0; i < tr.length; i++) {
+                if (tr[i].classList.contains('location-row')) {
+                    currentLocIndex = i;
+                    showChildrenOfLoc = (tr[i].dataset.isMatch === 'true');
+                } else if (tr[i].classList.contains('eq-row')) {
+                    if (tr[i].dataset.isMatch === 'true' && currentLocIndex !== -1) {
+                        tr[currentLocIndex].style.display = "";
+                    } else if (showChildrenOfLoc) {
+                        tr[i].style.display = "";
                     }
                 }
+            }
+        }
+    };
 
-                let otReal = actPorEquipo[tag][sem];
+    function drawGanttPM() {
+        const container = document.getElementById('gantt_pm_container');
+        
+        let html = `
+            <table class="pm-table" id="pm_table_render">
+                <thead>
+                    <tr>
+                        <th class="pm-tag-col">📍 UBICACIÓN / ↳ EQUIPO</th>
+                        ${Array.from({length:52}, (_,i)=>`<th>S${i+1}</th>`).join('')}
+                    </tr>
+                </thead>
+                <tbody>
+        `;
 
-                if (otReal) {
-                    let cssClass = otReal.status === 'realizada' ? 'pm-ok' : (otReal.status === 'en proceso' ? 'pm-proc' : 'pm-pend');
-                    let icon = otReal.status === 'realizada' ? '✓' : '!';
-                    cellHtml = `<div class="pm-cell-inner"><div class="${cssClass}" onclick="document.getElementById('btn_tab_list').click(); setTimeout(() => renderDetail('${otReal.id}'), 100);" title="Ver OT Real">${icon}</div></div>`;
-                } else if (isPlanned) {
-                    cellHtml = `<div class="pm-cell-inner"><div class="pm-plan" title="Mantenimiento Planificado según Frecuencia Base"></div></div>`;
+        const dataAnio = matrizSAP[currentPmYear] || {};
+        const dataClase = dataAnio[currentPmClass] || {};
+        const ubicacionesSAP = Object.keys(dataClase).sort();
+
+        let spOtsBySapLoc = {};
+        currentChartData.forEach(d => {
+            let ubiSP = (d.ubicacion || "").toUpperCase();
+            let sapLoc = mapaSpSap[ubiSP];
+            if (sapLoc && d.semana && d.semana !== "S/N") {
+                if(!spOtsBySapLoc[sapLoc]) spOtsBySapLoc[sapLoc] = {};
+                if(!spOtsBySapLoc[sapLoc][d.semana]) spOtsBySapLoc[sapLoc][d.semana] = [];
+                spOtsBySapLoc[sapLoc][d.semana].push(d);
+            }
+        });
+
+        ubicacionesSAP.forEach(ubi => {
+            html += `<tr class="location-row"><td class="pm-tag-col loc-bg" title="${ubi}">📍 ${ubi}</td>`;
+            let spOts = spOtsBySapLoc[ubi] || {};
+            
+            for(let sem=1; sem<=52; sem++) {
+                let otsSemana = spOts[sem.toString()];
+                if (otsSemana && otsSemana.length > 0) {
+                    let st = otsSemana[0].status; 
+                    let css = st==='realizada'?'pm-ok':(st==='en proceso'?'pm-proc':'pm-pend');
+                    let icon = st==='realizada'?'✓':'!';
+                    let multi = otsSemana.length > 1 ? '<div class="pm-multi">+</div>' : '';
+                    
+                    let dataJson = encodeURIComponent(JSON.stringify(otsSemana.map(o=>({
+                        equipo: ubi + " (Actividad de SharePoint)",
+                        ubicacion: o.ubicacion,
+                        actividad: o.titulo,
+                        ot: o.ot || "SP_ID: " + o.id_real,
+                        fecha_prog: "Semana " + o.semana,
+                        status: o.status,
+                        key_id: o.key_id
+                    }))));
+                    html += `<td class="loc-bg"><div class="pm-cell-inner"><div class="${css}" onclick="showModalPM('${dataJson}')">${icon}${multi}</div></div></td>`;
+                } else {
+                    html += `<td class="loc-bg"></td>`;
                 }
-
-                html += `<td>${cellHtml}</td>`;
             }
             html += `</tr>`;
+
+            let equipos = Object.keys(dataClase[ubi]).sort();
+            equipos.forEach(eq => {
+                html += `<tr class="eq-row"><td class="pm-tag-col" title="${eq}">↳ ${eq}</td>`;
+                let eqSemanas = dataClase[ubi][eq];
+                
+                for(let sem=1; sem<=52; sem++) {
+                    let otsSemana = eqSemanas[sem.toString()];
+                    if (otsSemana && otsSemana.length > 0) {
+                        let st = otsSemana[0].status;
+                        let css = st==='realizada'?'pm-ok':(st==='en proceso'?'pm-proc':'pm-pend');
+                        let icon = st==='realizada'?'✓':'!';
+                        let multi = otsSemana.length > 1 ? '<div class="pm-multi">+</div>' : '';
+
+                        let dataJson = encodeURIComponent(JSON.stringify(otsSemana.map(o=>({
+                            equipo: eq,
+                            ubicacion: ubi,
+                            actividad: o.titulo,
+                            ot: o.ot,
+                            fecha_prog: o.fecha_prog,
+                            status: o.status
+                        }))));
+                        html += `<td><div class="pm-cell-inner"><div class="${css}" onclick="showModalPM('${dataJson}')">${icon}${multi}</div></div></td>`;
+                    } else {
+                        html += `<td></td>`;
+                    }
+                }
+                html += `</tr>`;
+            });
         });
 
         html += `</tbody></table>`;
         container.innerHTML = html;
+        filtrarGanttPM(); 
     }
 
-    // --- EFECTO ANTIGRAVEDAD / PARTÍCULAS ---
     const initAntigravity = () => {
         const canvas = document.createElement('canvas');
-        canvas.id = 'antigravity-bg';
-        document.body.prepend(canvas);
-        const ctx = canvas.getContext('2d');
-
-        canvas.style.position = 'fixed';
-        canvas.style.top = '0';
-        canvas.style.left = '0';
-        canvas.style.width = '100vw';
-        canvas.style.height = '100vh';
-        canvas.style.zIndex = '-1'; 
-        canvas.style.pointerEvents = 'none';
-        canvas.style.backgroundColor = '#f8fafc';
-
-        let particles = [];
-        const colors = ['#4285F4', '#EA4335', '#FBBC05', '#34A853', '#A0C3FF', '#FCA297'];
-        let mouse = { x: null, y: null, radius: 120 };
-
-        window.addEventListener('mousemove', (e) => {
-            mouse.x = e.x;
-            mouse.y = e.y;
-        });
-
-        window.addEventListener('mouseout', () => {
-            mouse.x = undefined;
-            mouse.y = undefined;
-        });
-
-        window.addEventListener('resize', () => {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-            initParticles();
-        });
+        canvas.id = 'antigravity-bg'; document.body.prepend(canvas); const ctx = canvas.getContext('2d');
+        canvas.style.position = 'fixed'; canvas.style.top = '0'; canvas.style.left = '0'; canvas.style.width = '100vw'; canvas.style.height = '100vh'; canvas.style.zIndex = '-1'; canvas.style.pointerEvents = 'none'; canvas.style.backgroundColor = '#f8fafc';
+        let particles = []; const colors = ['#4285F4', '#EA4335', '#FBBC05', '#34A853', '#A0C3FF', '#FCA297']; let mouse = { x: null, y: null, radius: 120 };
+        window.addEventListener('mousemove', (e) => { mouse.x = e.x; mouse.y = e.y; });
+        window.addEventListener('mouseout', () => { mouse.x = undefined; mouse.y = undefined; });
+        window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; initParticles(); });
 
         class Particle {
-            constructor(x, y) {
-                this.x = x;
-                this.y = y;
-                this.baseX = x;
-                this.baseY = y;
-                this.size = Math.random() * 2 + 1.5;
-                this.color = colors[Math.floor(Math.random() * colors.length)];
-                this.density = (Math.random() * 20) + 2;
-            }
-            draw() {
-                ctx.fillStyle = this.color;
-                ctx.beginPath();
-                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
-                ctx.closePath();
-                ctx.fill();
-            }
-            update() {
-                let dx = mouse.x - this.x;
-                let dy = mouse.y - this.y;
-                let distance = Math.sqrt(dx * dx + dy * dy);
-                
-                if (distance < mouse.radius) {
-                    let forceDirectionX = dx / distance;
-                    let forceDirectionY = dy / distance;
-                    let force = (mouse.radius - distance) / mouse.radius;
-                    let directionX = forceDirectionX * force * this.density;
-                    let directionY = forceDirectionY * force * this.density;
-                    
-                    this.x -= directionX;
-                    this.y -= directionY;
-                } else {
-                    if (this.x !== this.baseX) {
-                        let dx = this.x - this.baseX;
-                        this.x -= dx / 15;
-                    }
-                    if (this.y !== this.baseY) {
-                        let dy = this.y - this.baseY;
-                        this.y -= dy / 15;
-                    }
-                }
-                this.draw();
-            }
+            constructor(x, y) { this.x = x; this.y = y; this.baseX = x; this.baseY = y; this.size = Math.random() * 2 + 1.5; this.color = colors[Math.floor(Math.random() * colors.length)]; this.density = (Math.random() * 20) + 2; }
+            draw() { ctx.fillStyle = this.color; ctx.beginPath(); ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2); ctx.closePath(); ctx.fill(); }
+            update() { let dx = mouse.x - this.x; let dy = mouse.y - this.y; let distance = Math.sqrt(dx * dx + dy * dy); if (distance < mouse.radius) { let forceDirectionX = dx / distance; let forceDirectionY = dy / distance; let force = (mouse.radius - distance) / mouse.radius; let directionX = forceDirectionX * force * this.density; let directionY = forceDirectionY * force * this.density; this.x -= directionX; this.y -= directionY; } else { if (this.x !== this.baseX) { let dx = this.x - this.baseX; this.x -= dx / 15; } if (this.y !== this.baseY) { let dy = this.y - this.baseY; this.y -= dy / 15; } } this.draw(); }
         }
-
-        function initParticles() {
-            particles = [];
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-            let numberOfParticles = (canvas.width * canvas.height) / 7000;
-            for (let i = 0; i < numberOfParticles; i++) {
-                let x = Math.random() * canvas.width;
-                let y = Math.random() * canvas.height;
-                particles.push(new Particle(x, y));
-            }
-        }
-
-        function animateParticles() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            for (let i = 0; i < particles.length; i++) {
-                particles[i].update();
-            }
-            requestAnimationFrame(animateParticles);
-        }
-
-        initParticles();
-        animateParticles();
+        function initParticles() { particles = []; canvas.width = window.innerWidth; canvas.height = window.innerHeight; let numberOfParticles = (canvas.width * canvas.height) / 7000; for (let i = 0; i < numberOfParticles; i++) { let x = Math.random() * canvas.width; let y = Math.random() * canvas.height; particles.push(new Particle(x, y)); } }
+        function animateParticles() { ctx.clearRect(0, 0, canvas.width, canvas.height); for (let i = 0; i < particles.length; i++) { particles[i].update(); } requestAnimationFrame(animateParticles); }
+        initParticles(); animateParticles();
     };
 
-    window.onload = () => {
-        buildFilters();
-        applyFilters();
-        initAntigravity();
-    };
+    window.onload = () => { buildFilters(); applyFilters(); initAntigravity(); };
     </script>
 </body></html>"""
 
     full_html = html_template.replace("__FECHA_ACTUAL__", fecha_actual)
     full_html = full_html.replace("__DB_JSON_DATA__", json.dumps(db_json))
-    full_html = full_html.replace("__FRECUENCIAS_JSON__", json.dumps(db_frecuencias))
+    full_html = full_html.replace("__MATRIZ_SAP_JSON__", json.dumps(matriz_sap_json))
+    full_html = full_html.replace("__MAPA_SP_SAP__", json.dumps(mapa_sp_sap))
     full_html = full_html.replace('\xa0', ' ')
     
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f: 
