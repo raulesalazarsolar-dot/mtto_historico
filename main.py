@@ -32,8 +32,10 @@ OUTPUT_HTML = "index.html"
 def procesar_bases_sap():
     print("⏳ Leyendo Excel de Equipos y OTs SAP para el Plan Matriz...")
     try:
-        # 1. Leer archivo de Equipos
-        df_eq = pd.read_excel('Copia de EVR-06-01 Equipos Críticos Planta Masas (5).xlsx', sheet_name='Clasificación ABC')
+        df_eq = pd.read_excel('Copia de EVR-06-01 Equipos Críticos Planta Masas (5).xlsx', 
+                              sheet_name='Clasificación ABC', 
+                              usecols=[1, 2, 3, 6, 14])
+        df_eq.columns = ['Eq', 'Nom', 'UbiSAP', 'UbiSP', 'Clase']
 
         def limpiar_codigo(codigo):
             c = str(codigo).strip().upper()
@@ -41,31 +43,26 @@ def procesar_bases_sap():
             if c.endswith('.0'): c = c[:-2]
             return c.lstrip('0')
 
-        df_eq['Eq'] = df_eq.iloc[:, 1].apply(limpiar_codigo)
-        df_eq['Nom'] = df_eq.iloc[:, 2].astype(str).str.strip()
-        df_eq['UbiSAP'] = df_eq.iloc[:, 3].astype(str).str.strip()
-        df_eq['UbiSP'] = df_eq.iloc[:, 6].astype(str).str.strip()
-        df_eq['Clase'] = df_eq.iloc[:, 14].astype(str).str.strip().str.upper()
+        df_eq['Eq'] = df_eq['Eq'].apply(limpiar_codigo)
+        df_eq['Nom'] = df_eq['Nom'].astype(str).str.strip()
+        df_eq['UbiSAP'] = df_eq['UbiSAP'].astype(str).str.strip()
+        df_eq['UbiSP'] = df_eq['UbiSP'].astype(str).str.strip()
+        df_eq['Clase'] = df_eq['Clase'].astype(str).str.strip().str.upper()
 
-        # Generar Mapa Traductor SP -> SAP
         mapa_sp_sap = {}
         for _, r in df_eq.iterrows():
             usp = r['UbiSP'].upper()
-            if usp and usp != 'NAN':
-                mapa_sp_sap[usp] = r['UbiSAP']
+            usap = r['UbiSAP']
+            if usp not in ['NAN', '', 'NONE'] and usap not in ['NAN', '', 'NONE']:
+                mapa_sp_sap[usp] = usap
 
-        # Filtro para la jerarquía SAP
-        mapa_eq = df_eq[df_eq['Clase'].isin(['A','B','C'])][['Eq','Nom','UbiSAP','Clase']].drop_duplicates(subset=['Eq'])
+        mapa_eq = df_eq[df_eq['Clase'].isin(['A','B','C'])].drop_duplicates(subset=['Eq'])
         mapa_eq = mapa_eq[mapa_eq['Eq'] != 'SIN_EQUIPO']
 
-        # 2. Leer archivo de OTs SAP
         df_ot = pd.read_excel('OT 2025 A 22.07.26.xlsx', dtype={'Equipo': str})
         df_ot['Eq'] = df_ot['Equipo'].apply(limpiar_codigo)
-
-        # Cruzar
         df_ot_cruzado = pd.merge(df_ot, mapa_eq, on='Eq', how='inner')
 
-        # Fechas
         df_ot_cruzado['Fecha'] = pd.to_datetime(df_ot_cruzado['Inic.prog.'], errors='coerce', dayfirst=True)
         df_ot_cruzado = df_ot_cruzado.dropna(subset=['Fecha'])
         df_ot_cruzado['Semana'] = df_ot_cruzado['Fecha'].dt.isocalendar().week.astype(int)
@@ -82,11 +79,11 @@ def procesar_bases_sap():
 
         matriz_sap = { '2025': {'A':{}, 'B':{}, 'C':{}}, '2026': {'A':{}, 'B':{}, 'C':{}} }
 
-        # Poblar esqueleto para que aparezcan equipos sin OTs
         for _, r in mapa_eq.iterrows():
             c = r['Clase']
             u = str(r['UbiSAP']).strip()
             if u.lower() in ['nan', 'none', '']: u = 'Sin Ubicación Asignada'
+            
             nom = str(r['Nom'])
             eq_disp = f"{r['Eq']} - {nom}" if nom.lower() != 'nan' else str(r['Eq'])
 
@@ -94,16 +91,24 @@ def procesar_bases_sap():
                 if u not in matriz_sap[a][c]: matriz_sap[a][c][u] = {}
                 if eq_disp not in matriz_sap[a][c][u]: matriz_sap[a][c][u][eq_disp] = {}
 
-        # Insertar datos de OTs SAP en el esqueleto
         for _, row in df_ot_cruzado.iterrows():
             a = str(row['Año'])
             c = row['Clase']
+            
             u = str(row['UbiSAP']).strip()
-            if u.lower() in ['nan', 'none', '']: u = 'Sin Ubicación Asignada'
+            if u.lower() in ['nan', 'none', '']:
+                u_ot = str(row.get('Ubicación técnica', '')).strip()
+                denom = str(row.get('Denom.ubic.técnica', '')).strip()
+                if u_ot and u_ot.lower() != 'nan': u = u_ot
+                elif denom and denom.lower() != 'nan': u = denom
+                else: u = 'Sin Ubicación Asignada'
+                
             nom = str(row['Nom'])
             eq_disp = f"{row['Eq']} - {nom}" if nom.lower() != 'nan' else str(row['Eq'])
             sem = str(row['Semana'])
 
+            if u not in matriz_sap[a][c]: matriz_sap[a][c][u] = {}
+            if eq_disp not in matriz_sap[a][c][u]: matriz_sap[a][c][u][eq_disp] = {}
             if sem not in matriz_sap[a][c][u][eq_disp]: matriz_sap[a][c][u][eq_disp][sem] = []
 
             matriz_sap[a][c][u][eq_disp][sem].append({
@@ -119,6 +124,8 @@ def procesar_bases_sap():
 
     except Exception as e:
         print(f"❌ Error procesando Excel SAP: {e}")
+        import traceback
+        traceback.print_exc()
         return {}, {}
 
 # ==========================================
@@ -220,9 +227,6 @@ def main():
             p = item.properties
             
             semana_val = limpiar(p.get("field_1"))
-            semanas_permitidas = [str(i) for i in range(3, 26)] 
-            if semana_val not in semanas_permitidas:
-                continue
 
             item_id = int(p.get("Id", 0))
             planta_raw = limpiar(p.get("Planta")).lower()
@@ -269,7 +273,7 @@ def main():
                 "ejecutor": limpiar(p.get("Responsable")) or "Sin Asignar",
                 "criticidad": crit_final,
                 "colaborador": colab_raw or "Interno",
-                "ubicacion": limpiar(p.get("field_5")), # Esta es la Ubicacion de SharePoint (Col G)
+                "ubicacion": limpiar(p.get("field_5")),
                 "sub_ubi": limpiar(p.get("field_6")),
                 "ot": limpiar(p.get("field_7")),
                 "zona": limpiar(p.get("Zona")),
@@ -335,9 +339,27 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
         .tab-btn { background: none; border: none; padding: 15px 5px; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 3px solid transparent; transition: 0.2s; font-size: 0.95rem; }
         .tab-btn:hover { color: var(--accent); } .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
         
-        .app-layout { display: flex; height: calc(100vh - 110px); width: 100%; overflow: hidden; }
+        .app-layout { display: flex; height: calc(100vh - 110px); width: 100%; overflow: hidden; position:relative; }
         
-        .col-filters { width: 280px; background: #fff; border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; z-index: 5; }
+        /* ESTILOS PANEL DE FILTROS FLOTANTE */
+        .col-filters { 
+            position: absolute; left: -320px; top: 0; bottom: 0; 
+            width: 320px; background: #fff; border-right: 1px solid var(--border); 
+            display: flex; flex-direction: column; z-index: 100; 
+            box-shadow: 5px 0 15px rgba(0,0,0,0.1); 
+            transition: left 0.4s cubic-bezier(0.4, 0, 0.2, 1); 
+        }
+        .col-filters.active { left: 0; }
+        
+        .btn-toggle-filters {
+            position: absolute; left: 20px; bottom: 20px; z-index: 90;
+            background: var(--accent); color: white; border: none; 
+            padding: 12px 20px; border-radius: 30px; font-weight: bold; 
+            cursor: pointer; box-shadow: 0 4px 10px rgba(37, 99, 235, 0.3);
+            display: flex; align-items: center; gap: 8px; transition: 0.3s;
+        }
+        .btn-toggle-filters:hover { transform: translateY(-2px); box-shadow: 0 6px 15px rgba(37, 99, 235, 0.4); }
+        
         .filters-header { padding: 15px 20px; border-bottom: 1px solid var(--border); font-weight: 700; color: var(--primary); font-size: 0.9rem; text-transform: uppercase; background: #f8fafc; display: flex; justify-content: space-between; align-items: center; }
         .filters-body { flex: 1; overflow-y: auto; padding: 20px; min-height: 0; } 
         .filters-footer { padding: 20px; border-top: 1px solid var(--border); background: #f8fafc; flex-shrink: 0; }
@@ -504,12 +526,17 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
     </div>
     
     <div class="app-layout">
+        
+        <!-- BOTÓN PARA MOSTRAR FILTROS -->
+        <button class="btn-toggle-filters" onclick="toggleFiltersPanel()">⚙️ Filtros Principales</button>
+        
         <div class="col-filters" id="main_filters">
             <div class="filters-header">
-                <span>🔍 Filtros Principales</span>
-                <button onclick="resetFilters()" class="btn-clean" style="margin: 0; padding: 4px 8px; width: auto; font-size: 0.7rem; border-color: #ef4444; color: #ef4444; display: flex; align-items: center; gap: 4px; text-transform: none; letter-spacing: normal;" title="Limpiar todos los filtros">
-                    🧹 Borrar
-                </button>
+                <span>🔍 Filtros</span>
+                <div style="display:flex; gap:8px;">
+                    <button onclick="resetFilters()" class="btn-clean" style="margin: 0; padding: 4px 8px; width: auto; font-size: 0.7rem; border-color: #ef4444; color: #ef4444; text-transform: none;">🧹 Borrar</button>
+                    <button onclick="toggleFiltersPanel()" class="btn-clean" style="margin: 0; padding: 4px 8px; width: auto; font-size: 0.7rem; border-color: var(--secondary); color: var(--secondary); text-transform: none;">❌ Cerrar</button>
+                </div>
             </div>
             
             <div class="filters-body" id="filters_dynamic"></div>
@@ -617,7 +644,7 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
                 <h2 style="color:var(--primary); margin:0; font-size:1.5rem;">Plan Matriz de Mantenimiento</h2>
                 
                 <div style="display:flex; align-items:center; gap: 15px;">
-                    <input type="text" id="search_pm" class="search-input" placeholder="🔍 Buscar Ubicación o Equipo..." onkeyup="filtrarGanttPM()" style="width:250px;">
+                    <input type="text" id="search_pm" class="search-input" placeholder="🔍 Buscar OT, Ubicación o Equipo..." onkeyup="filtrarGanttPM()" style="width:300px;">
                     <div style="display:flex; gap:10px; font-size:0.8rem; font-weight:700;">
                         <span style="background:#dcfce7; color:#166534; padding:4px 8px; border-radius:4px;">🟩 Realizada</span>
                         <span style="background:#fef3c7; color:#92400e; padding:4px 8px; border-radius:4px;">🟨 En Proceso</span>
@@ -648,12 +675,10 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
     Chart.register(ChartDataLabels);
     Chart.defaults.plugins.datalabels.display = false; 
 
-    // DATOS DE SHAREPOINT
+    // DATOS DE SHAREPOINT Y SAP
     const db = __DB_JSON_DATA__;
     const records = Object.values(db).sort((a,b) => b.id_real - a.id_real);
     const weeks = [...new Set(records.map(x=>x.semana).filter(x=>x!=="S/N"))].sort((a,b)=>{ let na=parseInt(a), nb=parseInt(b); return (isNaN(na)||isNaN(nb)) ? a.localeCompare(b) : na-nb; });
-    
-    // DATOS INTEGRADOS PARA EL PLAN MATRIZ (SAP + TRADUCTOR)
     const matrizSAP = __MATRIZ_SAP_JSON__;
     const mapaSpSap = __MAPA_SP_SAP__;
 
@@ -663,16 +688,49 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
     let currentPlanta = 'masas';
     let currentPmYear = '2026';
     let currentPmClass = 'A';
+    let filterTimer;
     
     Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
     Chart.defaults.color = '#64748b';
+
+    // Función Helper para fechas invertidas (YYYY-MM-DD -> DD-MM-YY)
+    function formatDateDDMMYY(dateStr) {
+        if(!dateStr || !dateStr.includes('-')) return dateStr;
+        let parts = dateStr.split('-');
+        if(parts.length === 3) {
+            let yy = parts[0].length === 4 ? parts[0].substring(2) : parts[0];
+            return `${parts[2]}-${parts[1]}-${yy}`;
+        }
+        return dateStr;
+    }
+
+    // --- MANEJO DEL PANEL DE FILTROS ---
+    function toggleFiltersPanel() {
+        const panel = document.getElementById('main_filters');
+        panel.classList.toggle('active');
+        if (panel.classList.contains('active')) {
+            startFilterTimer();
+        } else {
+            clearTimeout(filterTimer);
+        }
+    }
+
+    function startFilterTimer() {
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => {
+            const panel = document.getElementById('main_filters');
+            if(panel.classList.contains('active')) panel.classList.remove('active');
+        }, 8000);
+    }
+
+    document.getElementById('main_filters').addEventListener('mousemove', startFilterTimer);
+    document.getElementById('main_filters').addEventListener('click', startFilterTimer);
 
     const getAreaResp = (ejecutor) => {
         let ejL = (ejecutor || '').toLowerCase();
         let mecanicos = ['luis lagos', 'luis guajardo', 'rubén carrasco', 'ruben carrasco', 
                          'marcelo rivera', 'vladimir berrios', 'rubén briceño', 'ruben briceño', 
                          'mantenimiento', 'javier cordova', 'nicolás chandia', 'nicolas chandia'];
-        
         if (mecanicos.some(nombre => ejL.includes(nombre))) return 'Mecánico';
         if (ejL.includes('autómata') || ejL.includes('automata')) return 'Autómata';
         if (ejL.includes('edward corona') || ejL.includes('frio') || ejL.includes('frío')) return 'Frio';
@@ -699,7 +757,7 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
         };
 
         let html = '';
-        html += createSelect('f_semana', '📆 Semana', weeks, '25');
+        html += createSelect('f_semana', '📆 Semana', weeks, 'ALL');
         html += createSelect('f_zona', '📍 Zona', [...new Set(records.map(x=>x.zona))].filter(Boolean).sort());
         html += createSelect('f_clase', '🛠️ Clase MTTO', [...new Set(records.map(x=>x.clase))].sort());
         html += createSelect('f_especialidad', '🧑‍🔧 Especialidad', ['Mecánico', 'Autómata', 'Frio', 'Infraestructura', 'Otros'].sort());
@@ -717,7 +775,6 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
     function resetFilters() {
         if(document.getElementById('search_input')) document.getElementById('search_input').value = '';
         document.querySelectorAll('.f-group select').forEach(sel => sel.value = "ALL");
-        if(document.getElementById('f_semana')) document.getElementById('f_semana').value = "ALL";
         applyFilters();
     }
 
@@ -784,9 +841,7 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
 
     function applyFilters() {
         currentChartData = getFilteredData();
-        
-        let ok = 0;
-        currentChartData.forEach(d => { if(d.status === 'realizada') ok++; });
+        let ok = 0; currentChartData.forEach(d => { if(d.status === 'realizada') ok++; });
         const total = currentChartData.length;
         
         document.getElementById('k_total').innerText = total;
@@ -802,7 +857,7 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
         else if (appState.view === 'charts') drawCharts(currentChartData);
         else if (appState.view === 'row') drawRowCharts(currentChartData);
         else if (appState.view === 'gantt') drawGantt(currentChartData);
-        else if (appState.view === 'gantt_pm') drawGanttPM(); // Actualiza PM con SP filtrado
+        else if (appState.view === 'gantt_pm') drawGanttPM();
     }
 
     function renderList(data) {
@@ -1135,7 +1190,7 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
                 <td style="font-weight:700;">${o.ot}</td>
                 <td>${o.equipo}<br><small style="color:var(--muted);">${o.ubicacion}</small></td>
                 <td>${o.actividad}</td>
-                <td>${o.fecha_prog}</td>
+                <td>${formatDateDDMMYY(o.fecha_prog)}</td>
                 <td style="color:${stColor}; font-weight:700; text-transform:uppercase;">${o.status}</td>
             </tr>`;
         });
@@ -1149,9 +1204,12 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
         let tr = document.querySelectorAll('#pm_table_render tbody tr');
         
         for (let i = 0; i < tr.length; i++) {
-            let td = tr[i].getElementsByTagName("td")[0];
+            let td = tr[i].getElementsByTagName("td")[0]; // Ubicacion/Equipo
+            let hiddenData = tr[i].getAttribute('data-search') || ""; // Datos Ocultos (OT, TAG)
+
             if (td) {
-                let isMatch = (td.textContent || td.innerText).toUpperCase().indexOf(input) > -1;
+                let textToSearch = ((td.textContent || td.innerText) + " " + hiddenData).toUpperCase();
+                let isMatch = textToSearch.indexOf(input) > -1;
                 tr[i].dataset.isMatch = isMatch;
                 tr[i].style.display = isMatch ? "" : "none";
             }
@@ -1179,12 +1237,22 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
     function drawGanttPM() {
         const container = document.getElementById('gantt_pm_container');
         
+        // Obtener el máximo de semanas dinámicamente
+        let maxSemanas = 52;
+        if(weeks && weeks.length > 0) {
+            let semInts = weeks.map(w => parseInt(w)).filter(n => !isNaN(n));
+            if(semInts.length > 0) {
+                let maxEncontrada = Math.max(...semInts);
+                if(maxEncontrada > maxSemanas) maxSemanas = maxEncontrada;
+            }
+        }
+
         let html = `
             <table class="pm-table" id="pm_table_render">
                 <thead>
                     <tr>
                         <th class="pm-tag-col">📍 UBICACIÓN / ↳ EQUIPO</th>
-                        ${Array.from({length:52}, (_,i)=>`<th>S${i+1}</th>`).join('')}
+                        ${Array.from({length:maxSemanas}, (_,i)=>`<th>S${i+1}</th>`).join('')}
                     </tr>
                 </thead>
                 <tbody>
@@ -1206,10 +1274,21 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
         });
 
         ubicacionesSAP.forEach(ubi => {
-            html += `<tr class="location-row"><td class="pm-tag-col loc-bg" title="${ubi}">📍 ${ubi}</td>`;
             let spOts = spOtsBySapLoc[ubi] || {};
             
-            for(let sem=1; sem<=52; sem++) {
+            // Recolectar datos ocultos para búsqueda en SP
+            let hiddenSearchSP = [];
+            Object.values(spOts).forEach(semanaArr => {
+                semanaArr.forEach(ot => {
+                    hiddenSearchSP.push(ot.ot || ot.key_id);
+                    hiddenSearchSP.push(ot.tag || "");
+                });
+            });
+            let dataSearchAttrSP = hiddenSearchSP.join(" ");
+
+            html += `<tr class="location-row" data-search="${dataSearchAttrSP}"><td class="pm-tag-col loc-bg" title="${ubi}">📍 ${ubi}</td>`;
+            
+            for(let sem=1; sem<=maxSemanas; sem++) {
                 let otsSemana = spOts[sem.toString()];
                 if (otsSemana && otsSemana.length > 0) {
                     let st = otsSemana[0].status; 
@@ -1235,10 +1314,18 @@ def generar_html_moderno(db_json, matriz_sap_json, mapa_sp_sap):
 
             let equipos = Object.keys(dataClase[ubi]).sort();
             equipos.forEach(eq => {
-                html += `<tr class="eq-row"><td class="pm-tag-col" title="${eq}">↳ ${eq}</td>`;
                 let eqSemanas = dataClase[ubi][eq];
                 
-                for(let sem=1; sem<=52; sem++) {
+                // Recolectar datos ocultos para búsqueda en SAP
+                let hiddenSearchSAP = [];
+                Object.values(eqSemanas).forEach(semanaArr => {
+                    semanaArr.forEach(ot => hiddenSearchSAP.push(ot.ot || ""));
+                });
+                let dataSearchAttrSAP = hiddenSearchSAP.join(" ");
+
+                html += `<tr class="eq-row" data-search="${dataSearchAttrSAP}"><td class="pm-tag-col" title="${eq}">↳ ${eq}</td>`;
+                
+                for(let sem=1; sem<=maxSemanas; sem++) {
                     let otsSemana = eqSemanas[sem.toString()];
                     if (otsSemana && otsSemana.length > 0) {
                         let st = otsSemana[0].status;
