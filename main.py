@@ -22,7 +22,7 @@ SITE_URL = "https://teams.wal-mart.com/sites/EquipoPlanificacin"
 LIST_NAME = "Seguimiento Infraestructura"
 
 USERNAME = os.environ.get("SP_USERNAME", "r0r0noi@cl.wal-mart.com")
-PASSWORD = os.environ.get("SP_PASSWORD", "dEbit.spLiT+9")
+PASSWORD = os.environ.get("SP_PASSWORD", "Panic020")
 
 OUTPUT_HTML = "index.html"
 
